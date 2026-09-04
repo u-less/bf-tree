@@ -28,7 +28,10 @@ use crate::{
     error::ConfigError,
     fs::VfsImpl,
     mini_page_op::LeafOperations,
-    nodes::{leaf_node::MiniPageNextLevel, LeafNode, INVALID_DISK_OFFSET},
+    nodes::{
+        leaf_node::{MiniPageNextLevel, OpType},
+        LeafNode, INVALID_DISK_OFFSET,
+    },
     nodes::{InnerNode, InnerNodeBuilder, PageID, DISK_PAGE_SIZE, INNER_NODE_SIZE},
     storage::{make_vfs, LeafStorage, PageLocation, PageTable},
     sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
@@ -1607,9 +1610,15 @@ impl BfTree {
             for entry in seg.entry_iter() {
                 let log_entry = LogEntry::read_from_buffer(entry.1);
                 match log_entry {
-                    LogEntry::Write(op) => {
-                        bf_tree.insert(op.key, op.value);
-                    }
+                    LogEntry::Write(op) => match op.op_type {
+                        OpType::Insert => {
+                            bf_tree.insert(op.key, op.value);
+                        }
+                        OpType::Delete => bf_tree.delete(op.key),
+                        OpType::Cache | OpType::Phantom => {
+                            unreachable!("cache-only operation found in WAL")
+                        }
+                    },
                     LogEntry::Split(_op) => {
                         todo!("implement split op in wal!")
                     }

@@ -349,6 +349,19 @@ impl LeafNode {
         [prefix, remaining].concat()
     }
 
+    #[inline]
+    fn copy_full_key_to(&self, meta: &LeafKVMeta, out_buffer: &mut [u8]) -> usize {
+        let key_len = meta.get_key_len() as usize;
+        let prefix_len = self.prefix_len as usize;
+        debug_assert!(out_buffer.len() >= key_len);
+
+        if prefix_len != 0 {
+            out_buffer[..prefix_len].copy_from_slice(self.get_prefix());
+        }
+        out_buffer[prefix_len..key_len].copy_from_slice(self.get_remaining_key(meta));
+        key_len
+    }
+
     /// Get the full key for low fence which is not prefix compressed
     pub(crate) fn get_low_fence_full_key(&self) -> Vec<u8> {
         debug_assert!(LOW_FENCE_IDX < self.meta.meta_count_with_fence() as usize);
@@ -515,12 +528,11 @@ impl LeafNode {
 
     /// Get # of keys strictly smaller than a merge_split_key
     #[allow(clippy::unused_enumerate_index)]
-    pub fn get_kv_num_below_key(&self, merge_split_key: &Vec<u8>) -> u16 {
+    pub fn get_kv_num_below_key(&self, merge_split_key: &[u8]) -> u16 {
         // Linear search
         let mut cnt: u16 = 0;
-        for (_, meta) in self.meta_iter().enumerate() {
-            let key = self.get_full_key(meta);
-            let cmp = key.cmp(merge_split_key);
+        for meta in self.meta_iter() {
+            let cmp = self.key_cmp(meta, merge_split_key);
             // Pick all records from the base page whose key is smaller
             // than merge_split_key
             if cmp == std::cmp::Ordering::Less {
@@ -995,19 +1007,29 @@ impl LeafNode {
     /// By convention, key_cmp(meta, key) returns the ordering matching the expression meta <operator> key if true.
     #[inline]
     pub(crate) fn key_cmp(&self, meta: &LeafKVMeta, key: &[u8]) -> Ordering {
-        let search_key_prefix = &key[(self.prefix_len as usize)..]
-            [..std::cmp::min(key.len() - self.prefix_len as usize, PREVIEW_SIZE)];
+        let prefix_len = self.prefix_len as usize;
+        if prefix_len != 0 {
+            let prefix = self.get_prefix();
+            let shared_len = prefix_len.min(key.len());
+            let prefix_cmp = prefix[..shared_len].cmp(&key[..shared_len]);
+            if prefix_cmp != Ordering::Equal {
+                return prefix_cmp;
+            }
+            if key.len() < prefix_len {
+                return Ordering::Greater;
+            }
+        }
 
-        let prefix_key = &meta.preview_bytes[..std::cmp::min(
-            PREVIEW_SIZE,
-            meta.get_key_len() as usize - self.prefix_len as usize,
-        )];
+        let search_key_postfix = &key[prefix_len..];
+        let search_key_prefix = &search_key_postfix[..search_key_postfix.len().min(PREVIEW_SIZE)];
+
+        let prefix_key = &meta.preview_bytes
+            [..std::cmp::min(PREVIEW_SIZE, meta.get_key_len() as usize - prefix_len)];
         let mut cmp = prefix_key.cmp(search_key_prefix);
 
         // If the prefix matches, compare the full key
         if cmp == Ordering::Equal {
             let full_key = self.get_remaining_key(meta);
-            let search_key_postfix = &key[self.prefix_len as usize..];
             cmp = full_key.cmp(search_key_postfix);
         }
         cmp
@@ -1920,53 +1942,32 @@ impl LeafNode {
 
         let meta = self.get_kv_meta(pos as usize);
 
+        if let Some(bound_key) = bound_key {
+            if self.key_cmp(meta, bound_key) == Ordering::Greater {
+                return GetScanRecordByPosResult::BoundKeyExceeded;
+            }
+        }
+
         if meta.op_type().is_absent() {
             return GetScanRecordByPosResult::Deleted;
         }
 
         match return_field {
             ScanReturnField::Value => {
-                if let Some(bk) = bound_key {
-                    let cmp = self.get_full_key(meta).as_slice().cmp(bk);
-                    if cmp == Ordering::Greater {
-                        return GetScanRecordByPosResult::BoundKeyExceeded;
-                    }
-                }
-
                 let value = self.get_value(meta);
                 let value_len = meta.value_len() as usize;
                 out_buffer[..value_len].copy_from_slice(value);
                 GetScanRecordByPosResult::Found(0, value_len as u32)
             }
             ScanReturnField::Key => {
-                let full_key = self.get_full_key(meta);
-
-                if let Some(bk) = bound_key {
-                    let cmp = full_key.as_slice().cmp(bk);
-                    if cmp == Ordering::Greater {
-                        return GetScanRecordByPosResult::BoundKeyExceeded;
-                    }
-                }
-
-                let key_len = full_key.len();
-                out_buffer[..key_len].copy_from_slice(&full_key);
+                let key_len = self.copy_full_key_to(meta, out_buffer);
                 GetScanRecordByPosResult::Found(key_len as u32, 0)
             }
             ScanReturnField::KeyAndValue => {
-                let full_key = self.get_full_key(meta);
-
-                if let Some(bk) = bound_key {
-                    let cmp = full_key.as_slice().cmp(bk);
-                    if cmp == Ordering::Greater {
-                        return GetScanRecordByPosResult::BoundKeyExceeded;
-                    }
-                }
-
-                let key_len = full_key.len();
+                let key_len = self.copy_full_key_to(meta, out_buffer);
                 let value = self.get_value(meta);
                 let value_len = meta.value_len() as usize;
 
-                out_buffer[..key_len].copy_from_slice(&full_key);
                 out_buffer[key_len..key_len + value_len].copy_from_slice(value);
 
                 GetScanRecordByPosResult::Found(key_len as u32, value_len as u32)
@@ -2098,6 +2099,46 @@ mod tests {
 
         meta.mark_as_deleted();
         assert!(meta.is_deleted());
+    }
+
+    #[test]
+    fn prefixed_key_comparison_handles_short_keys_and_deleted_scan_bound() {
+        let page = unsafe {
+            &mut *LeafNode::make_base_page(4096, crate::snapshot::INVALID_SNAPSHOT_VERSION)
+        };
+        page.initialize(
+            b"prefix-a",
+            b"prefix-z",
+            4096,
+            MiniPageNextLevel::new_null(),
+            true,
+            false,
+            crate::snapshot::INVALID_SNAPSHOT_VERSION,
+        );
+        assert!(page.insert(b"prefix-m", b"value", OpType::Insert, 32));
+
+        let record_pos = page.first_meta_pos_after_fence() as u32;
+        let meta = page.get_kv_meta(record_pos as usize);
+        assert_eq!(page.key_cmp(meta, b"pre"), Ordering::Greater);
+        assert_eq!(page.key_cmp(meta, b"prefix-m"), Ordering::Equal);
+        assert_eq!(page.key_cmp(meta, b"prefix-z"), Ordering::Less);
+
+        let mut out = [0u8; 32];
+        let result =
+            page.get_record_by_pos_with_bound(record_pos, &mut out, ScanReturnField::Key, &None);
+        assert!(matches!(result, GetScanRecordByPosResult::Found(8, 0)));
+        assert_eq!(&out[..8], b"prefix-m");
+
+        page.get_kv_meta_mut(record_pos as usize).mark_as_deleted();
+        let result = page.get_record_by_pos_with_bound(
+            record_pos,
+            &mut out,
+            ScanReturnField::Key,
+            &Some(b"pre".to_vec()),
+        );
+        assert!(matches!(result, GetScanRecordByPosResult::BoundKeyExceeded));
+
+        LeafNode::free_base_page(page);
     }
 
     /// This test verifies that the merge split key divides

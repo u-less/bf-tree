@@ -78,5 +78,8 @@ metrics-rt-debug-timer = [
     "dep:variant_count",
 ]
 
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("spdk"))'] }
+
 [profile.release]
 debug = true

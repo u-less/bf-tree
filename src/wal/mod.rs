@@ -35,7 +35,10 @@ struct RawBuffer {
 impl RawBuffer {
     fn new(buffer_size: usize) -> RawBuffer {
         let layout = std::alloc::Layout::from_size_align(buffer_size, BLOCK_SIZE).unwrap();
-        let ptr = unsafe { std::alloc::alloc(layout) };
+        let ptr = unsafe { std::alloc::alloc_zeroed(layout) };
+        if ptr.is_null() {
+            std::alloc::handle_alloc_error(layout);
+        }
         RawBuffer { ptr, buffer_size }
     }
 
@@ -62,29 +65,40 @@ struct WriteAheadLogInner {
     buffer: RawBuffer,
     file_handle: Arc<dyn VfsImpl>,
     buffer_cursor: usize,
+    flushed_cursor: usize,
     file_offset: usize,
     next_lsn: u64,
-    flushed_lsn: u64,
+    next_flushed_lsn: u64,
     need_flush: bool,
 }
 
 impl WriteAheadLogInner {
-    fn flush(&mut self) {
+    fn flush(&mut self, rotate_segment: bool) {
         if self.buffer_cursor == 0 {
-            // nothing to flush
+            self.need_flush = false;
             return;
         }
 
         self.clear_next_header();
-        self.file_handle
-            .write(self.file_offset, self.buffer.as_slice());
+        let write_start = self.flushed_cursor / BLOCK_SIZE * BLOCK_SIZE;
+        let write_end = (self.buffer_cursor + std::mem::size_of::<u64>())
+            .min(self.buffer.buffer_size)
+            .next_multiple_of(BLOCK_SIZE)
+            .min(self.buffer.buffer_size);
+        self.file_handle.write(
+            self.file_offset + write_start,
+            &self.buffer.as_slice()[write_start..write_end],
+        );
+        self.file_handle.flush();
+        self.flushed_cursor = self.buffer_cursor;
 
-        if !self.should_inplace_flush() {
+        if rotate_segment || !self.should_inplace_flush() {
             self.file_offset += self.buffer.buffer_size;
             self.buffer_cursor = 0;
+            self.flushed_cursor = 0;
         }
 
-        self.flushed_lsn = self.next_lsn - 1;
+        self.next_flushed_lsn = self.next_lsn;
         self.need_flush = false;
     }
 
@@ -129,15 +143,20 @@ pub(crate) struct WriteAheadLog {
 impl WriteAheadLog {
     /// Create a new wal instance, and start a background thread to flush wal buffer.
     pub(crate) fn new(config: Arc<WalConfig>) -> Arc<Self> {
+        assert!(
+            config.segment_size >= BLOCK_SIZE && config.segment_size.is_multiple_of(BLOCK_SIZE),
+            "WAL segment size must be a positive multiple of {BLOCK_SIZE} bytes"
+        );
         let vfs = make_vfs(&config.storage_backend, &config.file_path);
         let wal = WriteAheadLog {
             inner: Mutex::new(WriteAheadLogInner {
                 buffer: RawBuffer::new(config.segment_size),
                 file_handle: vfs,
                 buffer_cursor: 0,
+                flushed_cursor: 0,
                 file_offset: 0,
                 next_lsn: 0,
-                flushed_lsn: 0,
+                next_flushed_lsn: 0,
                 need_flush: false,
             }),
             flushed_cond: Condvar::new(),
@@ -158,7 +177,7 @@ impl WriteAheadLog {
 
     pub(crate) fn stop_background_job(&self) {
         self.background_job_running
-            .store(false, std::sync::atomic::Ordering::Relaxed);
+            .store(false, std::sync::atomic::Ordering::Release);
         self.need_flush_cond.notify_all();
     }
 
@@ -178,14 +197,16 @@ impl WriteAheadLog {
 
             if !self
                 .background_job_running
-                .load(std::sync::atomic::Ordering::Relaxed)
+                .load(std::sync::atomic::Ordering::Acquire)
             {
-                // stop the background job, gracefully shutdown.
+                inner.flush(false);
+                self.flushed_cond.notify_all();
                 break;
             }
 
             if inner.need_flush || last_flush.elapsed() > flush_interval {
-                inner.flush();
+                let rotate_segment = inner.need_flush;
+                inner.flush(rotate_segment);
                 last_flush = std::time::Instant::now();
                 self.flushed_cond.notify_all();
             }
@@ -202,18 +223,19 @@ impl WriteAheadLog {
 
         // log header + wal size
         let required_bytes = std::mem::size_of::<LogHeader>() + log_entry.log_size();
-        let remaining = inner.buffer.buffer_size - inner.buffer_cursor;
-        if required_bytes > remaining {
-            // need to flush buffer
+        assert!(
+            required_bytes <= inner.buffer.buffer_size,
+            "WAL entry size {required_bytes} exceeds segment size {}",
+            inner.buffer.buffer_size
+        );
+
+        while required_bytes > inner.buffer.buffer_size - inner.buffer_cursor {
             inner.need_flush = true;
             self.need_flush_cond.notify_all();
             inner = self
                 .flushed_cond
-                .wait_while(inner, |inner| !inner.need_flush)
+                .wait_while(inner, |inner| inner.need_flush)
                 .unwrap();
-            // we need to retry here because by the time we wake up, the buffer maybe already full again.
-            drop(inner);
-            return self.append_and_wait(log_entry, page_offset);
         }
 
         let lsn = inner.alloc_lsn();
@@ -222,7 +244,7 @@ impl WriteAheadLog {
         buffer[0..LogHeader::size()].copy_from_slice(header.as_slice());
         log_entry.write_to_buffer(&mut buffer[LogHeader::size()..]);
 
-        while inner.flushed_lsn < lsn {
+        while inner.next_flushed_lsn <= lsn {
             inner = self.flushed_cond.wait(inner).unwrap();
         }
         lsn
@@ -292,21 +314,24 @@ impl Iterator for WalSegmentIter<'_> {
 
         let mut buffer = vec![0u8; self.reader.segment_size];
         let page_offset = self.cursor;
+        let bytes_to_read = self
+            .reader
+            .segment_size
+            .min(self.reader.file_size - self.cursor as usize);
 
         #[cfg(unix)]
         {
             self.reader
                 .log_file
-                .read_exact_at(&mut buffer, page_offset)
+                .read_exact_at(&mut buffer[..bytes_to_read], page_offset)
                 .unwrap();
         }
         #[cfg(windows)]
         {
-            let bytes_to_read = buffer.len();
             let bytes_read = self
                 .reader
                 .log_file
-                .seek_read(&mut buffer, page_offset)
+                .seek_read(&mut buffer[..bytes_to_read], page_offset)
                 .unwrap();
             assert_eq!(bytes_to_read, bytes_read);
         }
@@ -428,6 +453,26 @@ mod tests {
         }
     }
 
+    struct BytesLogEntry {
+        bytes: Vec<u8>,
+    }
+
+    impl LogEntryImpl<'_> for BytesLogEntry {
+        fn log_size(&self) -> usize {
+            self.bytes.len()
+        }
+
+        fn write_to_buffer(&self, buffer: &mut [u8]) {
+            buffer.copy_from_slice(&self.bytes);
+        }
+
+        fn read_from_buffer(buffer: &[u8]) -> Self {
+            Self {
+                bytes: buffer.to_vec(),
+            }
+        }
+    }
+
     fn make_test_wal(name: &str, segment_size: usize) -> Arc<WriteAheadLog> {
         let tmp_dir = std::env::temp_dir();
         let tmp_file = tmp_dir.join(name);
@@ -471,6 +516,79 @@ mod tests {
             }
         }
         assert_eq!(cnt, log_entry_cnt);
+        std::fs::remove_file(tmp_file).unwrap();
+    }
+
+    #[test]
+    fn first_append_is_durable_before_returning() {
+        const TEST_SEGMENT_SIZE: usize = 512;
+        let pid = std::process::id();
+        let tid = utils::thread_id_to_u64(std::thread::current().id());
+        let wal = make_test_wal(
+            &format!("wal_first_append_test_{pid}_{tid}.log"),
+            TEST_SEGMENT_SIZE,
+        );
+        let tmp_file = wal.config.file_path.clone();
+
+        let log = TestLogEntry::new(42);
+        assert_eq!(wal.append_and_wait(&log, 7), 0);
+
+        let reader = WalReader::new(&tmp_file, TEST_SEGMENT_SIZE);
+        let entries = reader
+            .segment_iter()
+            .flat_map(|segment| {
+                segment
+                    .entry_iter()
+                    .map(|(header, data)| (header, data.to_vec()))
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].0.lsn, 0);
+        assert_eq!(entries[0].0.page_offset, 7);
+        assert_eq!(TestLogEntry::read_from_buffer(&entries[0].1).val, 42);
+
+        wal.stop_background_job();
+        drop(wal);
+        std::fs::remove_file(tmp_file).unwrap();
+    }
+
+    #[test]
+    fn append_rotates_when_entry_does_not_fit_remaining_segment() {
+        const TEST_SEGMENT_SIZE: usize = 512;
+        let pid = std::process::id();
+        let tid = utils::thread_id_to_u64(std::thread::current().id());
+        let wal = make_test_wal(
+            &format!("wal_rotate_test_{pid}_{tid}.log"),
+            TEST_SEGMENT_SIZE,
+        );
+        let tmp_file = wal.config.file_path.clone();
+
+        let first = BytesLogEntry {
+            bytes: vec![1; 200],
+        };
+        let second = BytesLogEntry {
+            bytes: vec![2; 300],
+        };
+        assert_eq!(wal.append_and_wait(&first, 1), 0);
+        assert_eq!(wal.append_and_wait(&second, 2), 1);
+
+        let reader = WalReader::new(&tmp_file, TEST_SEGMENT_SIZE);
+        let entries = reader
+            .segment_iter()
+            .flat_map(|segment| {
+                segment
+                    .entry_iter()
+                    .map(|(header, data)| (header, data.to_vec()))
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].1, first.bytes);
+        assert_eq!(entries[1].1, second.bytes);
+
+        wal.stop_background_job();
+        drop(wal);
         std::fs::remove_file(tmp_file).unwrap();
     }
 

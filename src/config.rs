@@ -556,7 +556,7 @@ impl WalConfig {
         Self {
             file_path: file_path.as_ref().to_path_buf(),
             flush_interval: Duration::from_millis(1),
-            segment_size: 1024 * 1024 * 1024,
+            segment_size: 1024 * 1024,
             storage_backend: StorageBackend::Std,
         }
     }
@@ -632,5 +632,11 @@ mod tests {
         let another_max_record_size = 8192;
         config.cb_max_record_size(another_max_record_size);
         assert_eq!(config.get_cb_max_record_size(), another_max_record_size);
+    }
+
+    #[test]
+    fn default_wal_segment_size_is_one_megabyte() {
+        let config = WalConfig::new("wal.log");
+        assert_eq!(config.segment_size, 1024 * 1024);
     }
 }

@@ -61,7 +61,11 @@ impl<'a> LogEntryImpl<'a> for WriteOp<'a> {
     fn read_from_buffer(buffer: &'a [u8]) -> WriteOp<'a> {
         let key_size = u16::from_le_bytes(buffer[0..2].try_into().unwrap()) as usize;
         let value_size = u16::from_le_bytes(buffer[2..4].try_into().unwrap()) as usize;
-        let op_type = unsafe { std::mem::transmute::<u8, OpType>(buffer[4]) };
+        let op_type = match buffer[4] {
+            0 => OpType::Insert,
+            1 => OpType::Delete,
+            value => panic!("invalid WAL operation type: {value}"),
+        };
         let key = &buffer[5..5 + key_size];
         let value = &buffer[5 + key_size..];
         assert_eq!(value.len(), value_size);
