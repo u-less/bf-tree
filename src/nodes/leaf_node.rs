@@ -539,24 +539,25 @@ impl LeafNode {
     pub fn get_cache_only_insert_split_key(&self, key: &[u8], new_record_size: &u16) -> Vec<u8> {
         let mut merge_split_key_1: Option<Vec<u8>> = None;
         let mut merge_split_key_2: Option<Vec<u8>> = None;
-        let mut diff_1: i16 = i16::MAX;
-        let mut diff_2: i16 = i16::MAX;
+        let mut diff_1: usize = usize::MAX;
+        let mut diff_2: usize = usize::MAX;
 
         // The total size of all records including the new record to insert
-        let mut total_merged_size: u16 = 0;
+        let mut total_merged_size: usize = 0;
 
         for meta in self.meta_iter() {
             let key_len = meta.get_key_len();
             let value_len = meta.value_len();
 
-            total_merged_size += key_len + value_len + std::mem::size_of::<LeafKVMeta>() as u16;
+            total_merged_size +=
+                key_len as usize + value_len as usize + std::mem::size_of::<LeafKVMeta>();
         }
 
-        total_merged_size += new_record_size + std::mem::size_of::<LeafKVMeta>() as u16;
+        total_merged_size += *new_record_size as usize + std::mem::size_of::<LeafKVMeta>();
         let split_target_size = total_merged_size / 2;
 
         // Search for the splitting key
-        let mut merged_size: u16 = 0;
+        let mut merged_size: usize = 0;
         let mut self_meta_iter = self.meta_iter();
         let mut self_meta_option = self_meta_iter.next();
 
@@ -569,7 +570,8 @@ impl LeafNode {
             while cmp == std::cmp::Ordering::Less {
                 let key_len = cur_base_meta.get_key_len();
                 let value_len = cur_base_meta.value_len();
-                merged_size += key_len + value_len + std::mem::size_of::<LeafKVMeta>() as u16;
+                merged_size +=
+                    key_len as usize + value_len as usize + std::mem::size_of::<LeafKVMeta>();
                 if merged_size >= split_target_size {
                     // Two split key candidates are already found
                     // Stop
@@ -577,18 +579,18 @@ impl LeafNode {
                         break;
                     }
 
-                    let left_side: u16 = merged_size
-                        - key_len
-                        - value_len
-                        - std::mem::size_of::<LeafKVMeta>() as u16;
+                    let left_side = merged_size
+                        - key_len as usize
+                        - value_len as usize
+                        - std::mem::size_of::<LeafKVMeta>();
                     let right_side = total_merged_size - left_side;
 
                     if merge_split_key_1.is_none() {
                         merge_split_key_1 = Some(cur_base_key);
-                        diff_1 = (left_side as i16 - right_side as i16).abs();
+                        diff_1 = left_side.abs_diff(right_side);
                     } else {
                         merge_split_key_2 = Some(cur_base_key);
-                        diff_2 = (left_side as i16 - right_side as i16).abs();
+                        diff_2 = left_side.abs_diff(right_side);
                     }
                 }
 
@@ -605,22 +607,22 @@ impl LeafNode {
 
         // Count the new key
         if merge_split_key_2.is_none() {
-            merged_size += new_record_size + std::mem::size_of::<LeafKVMeta>() as u16;
+            merged_size += *new_record_size as usize + std::mem::size_of::<LeafKVMeta>();
 
             if merged_size >= split_target_size {
                 // Two split key candidates are already found
                 // Stop
 
-                let left_side: u16 =
-                    merged_size - new_record_size - std::mem::size_of::<LeafKVMeta>() as u16;
+                let left_side =
+                    merged_size - *new_record_size as usize - std::mem::size_of::<LeafKVMeta>();
                 let right_side = total_merged_size - left_side;
 
                 if merge_split_key_1.is_none() {
                     merge_split_key_1 = Some(key.to_vec());
-                    diff_1 = (left_side as i16 - right_side as i16).abs();
+                    diff_1 = left_side.abs_diff(right_side);
                 } else {
                     merge_split_key_2 = Some(key.to_vec());
-                    diff_2 = (left_side as i16 - right_side as i16).abs();
+                    diff_2 = left_side.abs_diff(right_side);
                 }
             }
         }
@@ -630,7 +632,8 @@ impl LeafNode {
             let base_meta = self_meta_option.unwrap();
             let key_len = base_meta.get_key_len();
             let value_len = base_meta.value_len();
-            merged_size += key_len + value_len + std::mem::size_of::<LeafKVMeta>() as u16;
+            merged_size +=
+                key_len as usize + value_len as usize + std::mem::size_of::<LeafKVMeta>();
 
             if merged_size >= split_target_size {
                 // Return the splitting key
@@ -639,16 +642,18 @@ impl LeafNode {
                     break;
                 }
 
-                let left_side: u16 =
-                    merged_size - key_len - value_len - std::mem::size_of::<LeafKVMeta>() as u16;
+                let left_side = merged_size
+                    - key_len as usize
+                    - value_len as usize
+                    - std::mem::size_of::<LeafKVMeta>();
                 let right_side = total_merged_size - left_side;
 
                 if merge_split_key_1.is_none() {
                     merge_split_key_1 = Some(cur_base_key);
-                    diff_1 = (left_side as i16 - right_side as i16).abs();
+                    diff_1 = left_side.abs_diff(right_side);
                 } else {
                     merge_split_key_2 = Some(cur_base_key);
-                    diff_2 = (left_side as i16 - right_side as i16).abs();
+                    diff_2 = left_side.abs_diff(right_side);
                 }
             }
             self_meta_option = self_meta_iter.next();
@@ -680,10 +685,10 @@ impl LeafNode {
     pub(crate) fn get_merge_split_key(&mut self, mini_page: &LeafNode) -> Vec<u8> {
         let mut merge_split_key_1: Option<Vec<u8>> = None;
         let mut merge_split_key_2: Option<Vec<u8>> = None;
-        let mut diff_1: i16 = i16::MAX;
-        let mut diff_2: i16 = i16::MAX;
+        let mut diff_1: usize = usize::MAX;
+        let mut diff_2: usize = usize::MAX;
 
-        let mut total_merged_size: u16 = 0;
+        let mut total_merged_size: usize = 0;
         let mut base_meta_iter = self.meta_iter();
         let mut cur_pos = base_meta_iter.cur;
         let mut cur_base_meta_option = base_meta_iter.next();
@@ -709,7 +714,7 @@ impl LeafNode {
                     let key_len = cur_base_meta.get_key_len();
                     let value_len = cur_base_meta.value_len();
                     total_merged_size +=
-                        key_len + value_len + std::mem::size_of::<LeafKVMeta>() as u16;
+                        key_len as usize + value_len as usize + std::mem::size_of::<LeafKVMeta>();
 
                     cur_pos = base_meta_iter.cur;
                     cur_base_meta_option = base_meta_iter.next();
@@ -734,7 +739,8 @@ impl LeafNode {
 
             let key_len = mini_meta.get_key_len();
             let value_len = mini_meta.value_len();
-            total_merged_size += key_len + value_len + std::mem::size_of::<LeafKVMeta>() as u16;
+            total_merged_size +=
+                key_len as usize + value_len as usize + std::mem::size_of::<LeafKVMeta>();
         }
 
         // Mini-page records are exhuasted, go through the rest of
@@ -743,7 +749,8 @@ impl LeafNode {
             let base_meta = cur_base_meta_option.unwrap();
             let key_len = base_meta.get_key_len();
             let value_len = base_meta.value_len();
-            total_merged_size += key_len + value_len + std::mem::size_of::<LeafKVMeta>() as u16;
+            total_merged_size +=
+                key_len as usize + value_len as usize + std::mem::size_of::<LeafKVMeta>();
 
             cur_base_meta_option = base_meta_iter.next();
         }
@@ -753,7 +760,7 @@ impl LeafNode {
 
         // Merge sort the distinct records from the mini page and the base page
         // until the size of the sorted records reaches the target split size
-        let mut merged_size: u16 = 0;
+        let mut merged_size: usize = 0;
         base_meta_iter = self.meta_iter();
         cur_base_meta_option = base_meta_iter.next();
 
@@ -775,7 +782,8 @@ impl LeafNode {
                 while cmp == std::cmp::Ordering::Less {
                     let key_len = cur_base_meta.get_key_len();
                     let value_len = cur_base_meta.value_len();
-                    merged_size += key_len + value_len + std::mem::size_of::<LeafKVMeta>() as u16;
+                    merged_size +=
+                        key_len as usize + value_len as usize + std::mem::size_of::<LeafKVMeta>();
                     if merged_size >= split_target_size {
                         // Two split key candidates are already found
                         // Stop
@@ -783,18 +791,18 @@ impl LeafNode {
                             break;
                         }
 
-                        let left_side: u16 = merged_size
-                            - key_len
-                            - value_len
-                            - std::mem::size_of::<LeafKVMeta>() as u16;
+                        let left_side = merged_size
+                            - key_len as usize
+                            - value_len as usize
+                            - std::mem::size_of::<LeafKVMeta>();
                         let right_side = total_merged_size - left_side;
 
                         if merge_split_key_1.is_none() {
                             merge_split_key_1 = Some(cur_base_key);
-                            diff_1 = (left_side as i16 - right_side as i16).abs();
+                            diff_1 = left_side.abs_diff(right_side);
                         } else {
                             merge_split_key_2 = Some(cur_base_key);
-                            diff_2 = (left_side as i16 - right_side as i16).abs();
+                            diff_2 = left_side.abs_diff(right_side);
                         }
                     }
 
@@ -817,7 +825,8 @@ impl LeafNode {
 
             let key_len = mini_meta.get_key_len();
             let value_len = mini_meta.value_len();
-            merged_size += key_len + value_len + std::mem::size_of::<LeafKVMeta>() as u16;
+            merged_size +=
+                key_len as usize + value_len as usize + std::mem::size_of::<LeafKVMeta>();
 
             if merged_size >= split_target_size {
                 // Two split key candidates are already found
@@ -826,16 +835,18 @@ impl LeafNode {
                     break;
                 }
 
-                let left_side: u16 =
-                    merged_size - key_len - value_len - std::mem::size_of::<LeafKVMeta>() as u16;
+                let left_side = merged_size
+                    - key_len as usize
+                    - value_len as usize
+                    - std::mem::size_of::<LeafKVMeta>();
                 let right_side = total_merged_size - left_side;
 
                 if merge_split_key_1.is_none() {
                     merge_split_key_1 = Some(cur_mini_key);
-                    diff_1 = (left_side as i16 - right_side as i16).abs();
+                    diff_1 = left_side.abs_diff(right_side);
                 } else {
                     merge_split_key_2 = Some(cur_mini_key);
-                    diff_2 = (left_side as i16 - right_side as i16).abs();
+                    diff_2 = left_side.abs_diff(right_side);
                 }
             }
         }
@@ -846,7 +857,8 @@ impl LeafNode {
             let base_meta = cur_base_meta_option.unwrap();
             let key_len = base_meta.get_key_len();
             let value_len = base_meta.value_len();
-            merged_size += key_len + value_len + std::mem::size_of::<LeafKVMeta>() as u16;
+            merged_size +=
+                key_len as usize + value_len as usize + std::mem::size_of::<LeafKVMeta>();
 
             if merged_size >= split_target_size {
                 // Return the splitting key
@@ -855,16 +867,18 @@ impl LeafNode {
                     break;
                 }
 
-                let left_side: u16 =
-                    merged_size - key_len - value_len - std::mem::size_of::<LeafKVMeta>() as u16;
+                let left_side = merged_size
+                    - key_len as usize
+                    - value_len as usize
+                    - std::mem::size_of::<LeafKVMeta>();
                 let right_side = total_merged_size - left_side;
 
                 if merge_split_key_1.is_none() {
                     merge_split_key_1 = Some(cur_base_key);
-                    diff_1 = (left_side as i16 - right_side as i16).abs();
+                    diff_1 = left_side.abs_diff(right_side);
                 } else {
                     merge_split_key_2 = Some(cur_base_key);
-                    diff_2 = (left_side as i16 - right_side as i16).abs();
+                    diff_2 = left_side.abs_diff(right_side);
                 }
             }
             cur_base_meta_option = base_meta_iter.next();
