@@ -3,22 +3,12 @@
 
 use std::cell::UnsafeCell;
 use std::collections::{HashMap, VecDeque};
-use std::mem::ManuallyDrop;
 use std::ops::{Deref, DerefMut};
 use std::panic;
 use std::path::Path;
 use std::path::PathBuf;
+use std::ptr::NonNull;
 use std::sync::Arc;
-
-#[cfg(not(all(feature = "shuttle", test)))]
-use rand::Rng;
-#[cfg(all(feature = "shuttle", test))]
-use shuttle::rand::Rng;
-
-#[cfg(unix)]
-use std::os::unix::fs::FileExt;
-#[cfg(windows)]
-use std::os::windows::fs::FileExt;
 
 #[cfg(any(feature = "metrics-rt-debug-all", feature = "metrics-rt-debug-timer"))]
 use thread_local::ThreadLocal;
@@ -26,7 +16,7 @@ use thread_local::ThreadLocal;
 use crate::{
     circular_buffer::CircularBuffer,
     error::ConfigError,
-    fs::VfsImpl,
+    fs::{read_exact_at, VfsImpl},
     mini_page_op::LeafOperations,
     nodes::{
         leaf_node::{MiniPageNextLevel, OpType},
@@ -36,8 +26,8 @@ use crate::{
     storage::{make_vfs, LeafStorage, PageLocation, PageTable},
     sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
     sync::RwLock,
-    utils::{atomic_wait, get_rng, inner_lock::ReadGuard, BfsVisitor, NodeInfo},
-    wal::{LogEntry, LogEntryImpl, WriteAheadLog},
+    utils::{atomic_wait, inner_lock::ReadGuard, random_range, BfsVisitor, NodeInfo},
+    wal::{WriteAheadLog, WriteOp},
     BfTree, Config, StorageBackend, WalConfig, WalReader,
 };
 // Used for macOS fallback sleep and tests
@@ -416,7 +406,7 @@ impl CPRSnapShotMgr {
             return Err(());
         }
 
-        let start = get_rng().random_range(0..DEFAULT_MAX_SNAPSHOT_THREAD_NUM);
+        let start = random_range(0..DEFAULT_MAX_SNAPSHOT_THREAD_NUM);
         let end = 2 * DEFAULT_MAX_SNAPSHOT_THREAD_NUM;
 
         for i in start..end {
@@ -1175,9 +1165,10 @@ impl CPRSnapShotMgr {
         // Check the recovery file is valid
         if !recovery_snapshot_file_path.as_ref().exists() {
             // if not already exist, we just create a new empty file at the location.
-            return Err(ConfigError::SnapshotFileInvalid(
-                "Not found ".to_string() + recovery_snapshot_file_path.as_ref().to_str().unwrap(),
-            ));
+            return Err(ConfigError::SnapshotFileInvalid(format!(
+                "Not found {}",
+                recovery_snapshot_file_path.as_ref().display()
+            )));
         }
 
         // Create WAL, if specified
@@ -1186,14 +1177,7 @@ impl CPRSnapShotMgr {
         // Retrieve the header of the snapshot file and construct a valid config for the to-be-recovered Bf-tree
         let reader = std::fs::File::open(recovery_snapshot_file_path.as_ref()).unwrap();
         let mut metadata = SectorAlignedVector::new_zeroed(DISK_PAGE_SIZE); // Metadata is at most one disk page in size
-        #[cfg(unix)]
-        {
-            reader.read_at(&mut metadata, 0).unwrap();
-        }
-        #[cfg(windows)]
-        {
-            reader.seek_read(&mut metadata, 0).unwrap();
-        }
+        read_exact_at(&reader, &mut metadata, 0).unwrap();
 
         let bf_meta = unsafe { (metadata.as_ptr() as *const BfTreeMeta).read() };
         bf_meta.check_magic();
@@ -1595,36 +1579,40 @@ impl BfTree {
         buffer_ptr: Option<*mut u8>,
         buffer_size: Option<usize>,
         wal: Option<Arc<WalConfig>>,
-    ) {
-        let bf_tree = BfTree::new_from_cpr_snapshot(
+    ) -> Result<BfTree, ConfigError> {
+        // Replay into a tree without a live WAL to avoid logging every recovered
+        // operation a second time. The new WAL writer is attached afterwards.
+        let mut bf_tree = BfTree::new_from_cpr_snapshot(
             recovery_snapshot_file_path,
             use_snapshot,
             buffer_ptr,
             buffer_size,
-            wal,
-        )
-        .unwrap();
-        let wal_reader = WalReader::new(wal_file, 4096);
+            None,
+        )?;
+        let segment_size = wal
+            .as_ref()
+            .map_or(1024 * 1024, |config| config.segment_size);
+        let wal_reader = WalReader::new(wal_file, segment_size);
 
         for seg in wal_reader.segment_iter() {
             for entry in seg.entry_iter() {
-                let log_entry = LogEntry::read_from_buffer(entry.1);
-                match log_entry {
-                    LogEntry::Write(op) => match op.op_type {
-                        OpType::Insert => {
-                            bf_tree.insert(op.key, op.value);
-                        }
-                        OpType::Delete => bf_tree.delete(op.key),
-                        OpType::Cache | OpType::Phantom => {
-                            unreachable!("cache-only operation found in WAL")
-                        }
-                    },
-                    LogEntry::Split(_op) => {
-                        todo!("implement split op in wal!")
+                let Some(op) = WriteOp::try_read_from_buffer(entry.1) else {
+                    continue;
+                };
+                match op.op_type {
+                    OpType::Insert => {
+                        bf_tree.insert(op.key, op.value);
+                    }
+                    OpType::Delete => bf_tree.delete(op.key),
+                    OpType::Cache | OpType::Phantom => {
+                        unreachable!("cache-only operation found in WAL")
                     }
                 }
             }
         }
+
+        bf_tree.wal = wal.map(WriteAheadLog::new);
+        Ok(bf_tree)
     }
 
     /// Take a new CPR snapshot
@@ -1664,43 +1652,60 @@ impl BfTree {
 }
 
 struct SectorAlignedVector {
-    inner: ManuallyDrop<Vec<u8>>,
+    ptr: NonNull<u8>,
+    len: usize,
 }
 
 impl Drop for SectorAlignedVector {
     fn drop(&mut self) {
-        let layout =
-            std::alloc::Layout::from_size_align(self.inner.capacity(), SECTOR_SIZE).unwrap();
-        let ptr = self.inner.as_mut_ptr();
-        unsafe {
-            std::alloc::dealloc(ptr, layout);
-        }
+        let layout = std::alloc::Layout::from_size_align(self.len, SECTOR_SIZE).unwrap();
+        unsafe { std::alloc::dealloc(self.ptr.as_ptr(), layout) };
     }
 }
 
 impl SectorAlignedVector {
-    fn new_zeroed(capacity: usize) -> Self {
-        let layout = std::alloc::Layout::from_size_align(capacity, SECTOR_SIZE).unwrap();
+    fn new_zeroed(len: usize) -> Self {
+        assert!(len != 0, "sector-aligned buffers cannot be empty");
+        let layout = std::alloc::Layout::from_size_align(len, SECTOR_SIZE).unwrap();
         let ptr = unsafe { std::alloc::alloc_zeroed(layout) };
+        let Some(ptr) = NonNull::new(ptr) else {
+            std::alloc::handle_alloc_error(layout);
+        };
+        Self { ptr, len }
+    }
 
-        let inner = unsafe { Vec::from_raw_parts(ptr, capacity, capacity) };
-        Self {
-            inner: ManuallyDrop::new(inner),
-        }
+    fn as_slice(&self) -> &[u8] {
+        unsafe { std::slice::from_raw_parts(self.ptr.as_ptr(), self.len) }
+    }
+
+    fn as_mut_slice(&mut self) -> &mut [u8] {
+        unsafe { std::slice::from_raw_parts_mut(self.ptr.as_ptr(), self.len) }
+    }
+}
+
+impl AsRef<[u8]> for SectorAlignedVector {
+    fn as_ref(&self) -> &[u8] {
+        self.as_slice()
+    }
+}
+
+impl AsMut<[u8]> for SectorAlignedVector {
+    fn as_mut(&mut self) -> &mut [u8] {
+        self.as_mut_slice()
     }
 }
 
 impl Deref for SectorAlignedVector {
-    type Target = Vec<u8>;
+    type Target = [u8];
 
     fn deref(&self) -> &Self::Target {
-        &self.inner
+        self.as_slice()
     }
 }
 
 impl DerefMut for SectorAlignedVector {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.inner
+        self.as_mut_slice()
     }
 }
 
@@ -1764,34 +1769,34 @@ fn serialize_vec_to_disk<T>(v: &[T], vfs: &Arc<dyn VfsImpl>) -> (usize, usize) {
     let unaligned_size = std::mem::size_of_val(v);
 
     let aligned_size = align_to_sector_size(unaligned_size);
-    let layout = std::alloc::Layout::from_size_align(aligned_size, SECTOR_SIZE).unwrap();
-    unsafe {
-        let aligned_ptr = std::alloc::alloc_zeroed(layout);
-        std::ptr::copy_nonoverlapping(unaligned_ptr, aligned_ptr, unaligned_size);
-        let slice = std::slice::from_raw_parts(aligned_ptr, aligned_size);
-        let offset = serialize_u8_slice_to_disk(slice, vfs);
-        std::alloc::dealloc(aligned_ptr, layout);
-        (offset, unaligned_size)
-    }
+    let mut aligned = SectorAlignedVector::new_zeroed(aligned_size);
+    unsafe { std::ptr::copy_nonoverlapping(unaligned_ptr, aligned.as_mut_ptr(), unaligned_size) };
+    let offset = serialize_u8_slice_to_disk(&aligned, vfs);
+    (offset, unaligned_size)
 }
 
-fn read_vec_from_offset<T: Clone>(offset: usize, size: usize, vfs: &Arc<dyn VfsImpl>) -> Vec<T> {
+fn read_vec_from_offset<T: Copy>(offset: usize, size: usize, vfs: &Arc<dyn VfsImpl>) -> Vec<T> {
     assert!(size > 0);
-    let slice = read_u8_slice_from_disk(offset, size, vfs);
-    let ptr = slice.as_ptr() as *const T;
-    let size = size / std::mem::size_of::<T>();
-    let slice = unsafe { std::slice::from_raw_parts(ptr, size) };
-    slice.to_vec()
-}
+    let element_size = std::mem::size_of::<T>();
+    assert_ne!(element_size, 0);
+    assert_eq!(size % element_size, 0);
+    let len = size / element_size;
+    let mut result = Vec::<T>::with_capacity(len);
+    unsafe { std::ptr::write_bytes(result.as_mut_ptr(), 0, len) };
+    let destination =
+        unsafe { std::slice::from_raw_parts_mut(result.as_mut_ptr().cast::<u8>(), size) };
+    let mut page_buffer = SectorAlignedVector::new_zeroed(DISK_PAGE_SIZE);
 
-fn read_u8_slice_from_disk(offset: usize, size: usize, vfs: &Arc<dyn VfsImpl>) -> Vec<u8> {
-    let mut res = Vec::new();
-    let mut buffer = vec![0; DISK_PAGE_SIZE];
-    for i in (0..size).step_by(DISK_PAGE_SIZE) {
-        vfs.read(offset + i, &mut buffer); // Read one disk page at a time
-        res.extend_from_slice(&buffer);
+    for (page, chunk) in destination.chunks_mut(DISK_PAGE_SIZE).enumerate() {
+        vfs.read(
+            offset + page * DISK_PAGE_SIZE,
+            &mut page_buffer[..chunk.len()],
+        );
+        chunk.copy_from_slice(&page_buffer[..chunk.len()]);
     }
-    res
+
+    unsafe { result.set_len(len) };
+    result
 }
 
 const SECTOR_SIZE: usize = 512;
@@ -1936,13 +1941,59 @@ mod cpr_handshake_miri {
 
 #[cfg(test)]
 mod tests {
-    use crate::{nodes::leaf_node::LeafReadResult, sync::thread, BfTree, Config};
+    use crate::{nodes::leaf_node::LeafReadResult, sync::thread, BfTree, Config, WalConfig};
     use std::panic;
     #[cfg(feature = "shuttle")]
     use std::path::PathBuf;
     use std::str::FromStr;
     use std::sync::atomic::Ordering;
     use std::sync::{atomic::AtomicBool, Arc};
+    use std::time::Duration;
+
+    #[test]
+    fn recovery_replays_write_ops_and_returns_the_tree() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let snapshot_path = temp_dir.path().join("tree.snapshot");
+        let wal_path = temp_dir.path().join("tree.wal");
+
+        let mut wal_config = WalConfig::new(&wal_path);
+        wal_config
+            .segment_size(512)
+            .flush_interval(Duration::from_micros(1));
+        let wal_config = Arc::new(wal_config);
+
+        let mut config = Config::new(":cache:", 64 * 1024);
+        config
+            .use_snapshot(true)
+            .enable_write_ahead_log(wal_config.clone());
+        let tree = BfTree::with_config(config, None).unwrap();
+        tree.insert(b"base", b"snapshot-value");
+        tree.cpr_snapshot(&snapshot_path);
+        tree.insert(b"key", b"replayed-value");
+        tree.insert(b"gone", b"deleted-value");
+        tree.delete(b"gone");
+        drop(tree);
+
+        let recovered = BfTree::recovery(
+            snapshot_path,
+            &wal_path,
+            false,
+            None,
+            None,
+            Some(wal_config),
+        )
+        .unwrap();
+        let mut output = [0; 64];
+        assert_eq!(
+            recovered.read(b"key", &mut output),
+            LeafReadResult::Found(14)
+        );
+        assert_eq!(&output[..14], b"replayed-value");
+        assert_eq!(
+            recovered.read(b"gone", &mut output),
+            LeafReadResult::Deleted
+        );
+    }
 
     /// Multiple writer threads write to a BfTree in parallel while a separate thread taking multiple snapshots
     /// A new BfTree recovered from the snapshot should contain a prefix of all the inserts from each writer thread.
@@ -2225,9 +2276,9 @@ mod tests {
         config.storage_backend(crate::StorageBackend::Memory);
         config.file_path(":memory:");
         config.cache_only = true;
-        // Use a buffer sufficient for the test data. 128KB is more than enough
-        // for 16 small records and avoids allocating 1GB per shuttle iteration.
-        config.cb_size_byte(1024 * 1024 * 1024);
+        // Keep the entire cache-only workload resident without allocating 1GB
+        // for every Shuttle iteration. This workload needs roughly 1MB.
+        config.cb_size_byte(4 * 1024 * 1024);
         config.cb_min_record_size = min_record_size;
         config.cb_max_record_size = max_record_size;
         config.leaf_page_size = leaf_page_size;
@@ -2301,7 +2352,11 @@ mod tests {
         let mut shuttle_config = shuttle::Config::default();
         //shuttle_config.max_steps = shuttle::MaxSteps::FailAfter(100_000);
         shuttle_config.max_steps = shuttle::MaxSteps::None;
-        shuttle_config.stack_size = 1024 * 1024 * 1024; // 1GB — default 32KB overflows with deep tree ops
+        // The default 32KB stack overflows during deep tree operations, while
+        // the previous 1GB setting exhausted the Windows page file when the
+        // portfolio runner created several workers. 4MB matches the disk test
+        // and leaves ample headroom without reserving gigabytes per worker.
+        shuttle_config.stack_size = 4 * 1024 * 1024;
         shuttle_config.failure_persistence =
             shuttle::FailurePersistence::File(Some(PathBuf::from_str("target").unwrap()));
 

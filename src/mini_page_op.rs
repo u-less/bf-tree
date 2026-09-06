@@ -1471,7 +1471,11 @@ impl<'a> LeafEntryXLocked<'a> {
             PageLocation::Base(offset) => *offset as u64,
             PageLocation::Mini(ptr) | PageLocation::Full(ptr) => {
                 let mini_page = self.load_cache_page(*ptr);
-                mini_page.next_level.as_offset() as u64
+                if mini_page.next_level.is_null() {
+                    u64::MAX
+                } else {
+                    mini_page.next_level.as_offset() as u64
+                }
             }
             PageLocation::Null => panic!("get_disk_offset on Null page"),
         }

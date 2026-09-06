@@ -8,6 +8,11 @@ mod std_vfs;
 mod std_direct_vfs;
 use std::sync::atomic::Ordering;
 
+#[cfg(unix)]
+use std::os::unix::fs::FileExt;
+#[cfg(windows)]
+use std::os::windows::fs::FileExt;
+
 #[cfg(target_os = "linux")]
 pub(crate) use std_direct_vfs::StdDirectVfs;
 
@@ -49,6 +54,52 @@ pub(crate) trait VfsImpl: Send + Sync {
         Self: Sized;
 }
 
+pub(crate) fn read_exact_at(
+    file: &std::fs::File,
+    mut buf: &mut [u8],
+    mut offset: u64,
+) -> std::io::Result<()> {
+    while !buf.is_empty() {
+        #[cfg(unix)]
+        let bytes_read = file.read_at(buf, offset)?;
+        #[cfg(windows)]
+        let bytes_read = file.seek_read(buf, offset)?;
+
+        if bytes_read == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "failed to fill the positioned read buffer",
+            ));
+        }
+        offset += bytes_read as u64;
+        buf = &mut buf[bytes_read..];
+    }
+    Ok(())
+}
+
+pub(crate) fn write_all_at(
+    file: &std::fs::File,
+    mut buf: &[u8],
+    mut offset: u64,
+) -> std::io::Result<()> {
+    while !buf.is_empty() {
+        #[cfg(unix)]
+        let bytes_written = file.write_at(buf, offset)?;
+        #[cfg(windows)]
+        let bytes_written = file.seek_write(buf, offset)?;
+
+        if bytes_written == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WriteZero,
+                "failed to write the positioned buffer",
+            ));
+        }
+        offset += bytes_written as u64;
+        buf = &buf[bytes_written..];
+    }
+    Ok(())
+}
+
 /// We need these pair of function because spdk don't work with arbitrary memory, it needs memory that is pinned.
 /// Which essentially requires allocating memory from spdk, not from us.
 pub(crate) fn buffer_alloc(layout: std::alloc::Layout) -> *mut u8 {
@@ -67,8 +118,12 @@ pub(crate) fn buffer_alloc(layout: std::alloc::Layout) -> *mut u8 {
     }
 
     #[cfg(not(feature = "spdk"))]
-    unsafe {
-        std::alloc::alloc(layout)
+    {
+        let ptr = unsafe { std::alloc::alloc(layout) };
+        if ptr.is_null() {
+            std::alloc::handle_alloc_error(layout);
+        }
+        ptr
     }
 }
 

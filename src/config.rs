@@ -158,9 +158,10 @@ impl Config {
     pub fn new(file_path: impl AsRef<Path>, circular_buffer_size: usize) -> Self {
         let mut config = Self::default();
         let mut cache_only = false;
-        let storage_backend = if file_path.as_ref().to_str().unwrap().starts_with(":memory:") {
+        let file_path_str = file_path.as_ref().to_str();
+        let storage_backend = if file_path_str.is_some_and(|path| path.starts_with(":memory:")) {
             StorageBackend::Memory
-        } else if file_path.as_ref().to_str().unwrap().starts_with(":cache:") {
+        } else if file_path_str.is_some_and(|path| path.starts_with(":cache:")) {
             cache_only = true;
             StorageBackend::Memory
         } else {
@@ -332,7 +333,12 @@ impl Config {
     /// to leverage different storage patterns
     /// (WAL is always sequence write and requires durability).
     pub fn enable_write_ahead_log_default(&mut self) -> &mut Self {
-        let wal_config = WalConfig::new(self.file_path.parent().unwrap().join("wal.log"));
+        let wal_path = self
+            .file_path
+            .parent()
+            .unwrap_or_else(|| Path::new(""))
+            .join("wal.log");
+        let wal_config = WalConfig::new(wal_path);
         self.write_ahead_log = Some(Arc::new(wal_config));
         self
     }

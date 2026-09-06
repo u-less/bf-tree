@@ -250,6 +250,9 @@ impl LeafNode {
     pub(crate) fn make_base_page(node_size: usize, snapshot_version: u64) -> *mut Self {
         let layout = Layout::from_size_align(node_size, std::mem::align_of::<LeafNode>()).unwrap();
         let ptr = unsafe { std::alloc::alloc(layout) };
+        if ptr.is_null() {
+            std::alloc::handle_alloc_error(layout);
+        }
         unsafe {
             Self::init_node_with_fence(
                 ptr,
@@ -1036,18 +1039,10 @@ impl LeafNode {
     }
 
     pub(crate) fn linear_lower_bound(&self, key: &[u8]) -> u16 {
-        debug_assert!(key.len() >= self.prefix_len as usize);
-
         let mut index = self.first_meta_pos_after_fence();
 
         while index < self.meta.meta_count_with_fence() {
             let key_meta = self.get_kv_meta(index as usize);
-
-            #[cfg(target_arch = "x86_64")]
-            unsafe {
-                // For bw-tree-like linear search, we use clflush to simulate pointer chasing.
-                core::arch::x86_64::_mm_clflush(key_meta as *const LeafKVMeta as *const u8);
-            }
             let cmp = self.key_cmp(key_meta, key);
 
             if cmp != Ordering::Less {
@@ -1063,11 +1058,21 @@ impl LeafNode {
     pub(crate) fn lower_bound(&self, key: &[u8]) -> u16 {
         let mut lower = self.first_meta_pos_after_fence();
         let mut upper = self.meta.meta_count_with_fence();
+        let prefix_len = self.prefix_len as usize;
 
-        let search_key_prefix = &key[(self.prefix_len as usize)..]
-            [..std::cmp::min(key.len() - self.prefix_len as usize, PREVIEW_SIZE)];
+        if prefix_len != 0 {
+            let prefix = self.get_prefix();
+            let shared_len = prefix_len.min(key.len());
+            match prefix[..shared_len].cmp(&key[..shared_len]) {
+                Ordering::Greater => return lower,
+                Ordering::Less => return upper,
+                Ordering::Equal if key.len() < prefix_len => return lower,
+                Ordering::Equal => {}
+            }
+        }
 
-        debug_assert!(key.len() >= self.prefix_len as usize);
+        let search_key_postfix = &key[prefix_len..];
+        let search_key_prefix = &search_key_postfix[..search_key_postfix.len().min(PREVIEW_SIZE)];
 
         while lower < upper {
             let mid = lower + (upper - lower) / 2;
@@ -1082,7 +1087,6 @@ impl LeafNode {
             // If the prefix matches, compare the full key
             if cmp == Ordering::Equal {
                 let remaining_key = self.get_remaining_key(key_meta);
-                let search_key_postfix = &key[self.prefix_len as usize..];
                 cmp = remaining_key.cmp(search_key_postfix);
             }
 
@@ -1714,20 +1718,16 @@ impl LeafNode {
         }
 
         let kv_meta = self.get_kv_meta(pos as usize);
-        let target_key = self.get_remaining_key(kv_meta);
-
-        // If the key is not already referenced, we need to mark it as referenced.
-        if !kv_meta.is_referenced() {
-            kv_meta.mark_as_ref();
-        }
-
-        let input_post_key = &search_key[self.prefix_len as usize..];
-        let cmp = target_key.cmp(input_post_key);
-
-        if cmp != Ordering::Equal {
+        if self.key_cmp(kv_meta, search_key) != Ordering::Equal {
             counter!(LeafNotFoundDueToKey);
             LeafReadResult::NotFound
         } else {
+            // Only a matching lookup should affect the second-chance eviction state.
+            // Marking the next greater key on every miss pollutes the cache under
+            // negative-read-heavy workloads.
+            if !kv_meta.is_referenced() {
+                kv_meta.mark_as_ref();
+            }
             if kv_meta.op_type().is_absent() {
                 return LeafReadResult::Deleted;
             }
@@ -2122,6 +2122,20 @@ mod tests {
         assert_eq!(page.key_cmp(meta, b"pre"), Ordering::Greater);
         assert_eq!(page.key_cmp(meta, b"prefix-m"), Ordering::Equal);
         assert_eq!(page.key_cmp(meta, b"prefix-z"), Ordering::Less);
+        assert_eq!(page.lower_bound(b"pre"), record_pos as u16);
+
+        let mut read_out = [0u8; 32];
+        assert_eq!(
+            page.read_by_key(b"prefix-l", &mut read_out),
+            LeafReadResult::NotFound
+        );
+        assert!(!meta.is_referenced());
+        assert_eq!(
+            page.read_by_key(b"prefix-m", &mut read_out),
+            LeafReadResult::Found(5)
+        );
+        assert!(meta.is_referenced());
+        assert_eq!(&read_out[..5], b"value");
 
         let mut out = [0u8; 32];
         let result =

@@ -425,6 +425,9 @@ impl CircularBuffer {
             }
             None => unsafe { std::alloc::alloc(layout) },
         };
+        if ptr.is_null() {
+            std::alloc::handle_alloc_error(layout);
+        }
 
         let copy_on_access_threshold = (capacity as f64 * (1.0 - copy_on_access_percent)) as usize;
 

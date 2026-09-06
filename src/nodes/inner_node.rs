@@ -58,6 +58,9 @@ impl InnerPtrGuard {
     fn make() -> Self {
         let layout = std::alloc::Layout::from_size_align(INNER_NODE_SIZE, INNER_NODE_SIZE).unwrap();
         let ptr = unsafe { std::alloc::alloc(layout) } as *mut InnerNode;
+        if ptr.is_null() {
+            std::alloc::handle_alloc_error(layout);
+        }
         Self { ptr }
     }
 
@@ -412,11 +415,13 @@ impl InnerNode {
                 .as_mut_ptr()
                 .add(pos * std::mem::size_of::<InnerKVMeta>()) as *mut InnerKVMeta) = new_meta;
 
-            std::ptr::copy_nonoverlapping(
-                key.as_ptr().add(InnerKVMeta::KEY_LOOK_AHEAD_SIZE),
-                pair_ptr,
-                post_key_len,
-            );
+            if post_key_len != 0 {
+                std::ptr::copy_nonoverlapping(
+                    key.as_ptr().add(InnerKVMeta::KEY_LOOK_AHEAD_SIZE),
+                    pair_ptr,
+                    post_key_len,
+                );
+            }
             std::ptr::write_unaligned(pair_ptr.add(post_key_len) as *mut PageID, child);
         }
 

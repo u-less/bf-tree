@@ -1,12 +1,6 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-#[cfg(not(all(feature = "shuttle", test)))]
-use rand::Rng;
-
-#[cfg(all(feature = "shuttle", test))]
-use shuttle::rand::Rng;
-
 use cfg_if::cfg_if;
 
 cfg_if! {
@@ -36,7 +30,7 @@ use crate::{
         atomic::{AtomicU64, Ordering},
         Arc,
     },
-    utils::{get_rng, inner_lock::ReadGuard, Backoff, BfsVisitor, NodeInfo},
+    utils::{inner_lock::ReadGuard, random_range, Backoff, BfsVisitor, NodeInfo},
     wal::{WriteAheadLog, WriteOp},
     Config, StorageBackend,
 };
@@ -455,11 +449,13 @@ impl BfTree {
     }
 
     pub(crate) fn should_promote_read(&self) -> bool {
-        get_rng().random_range(0..100) < self.config.read_promotion_rate.load(Ordering::Relaxed)
+        let rate = self.config.read_promotion_rate.load(Ordering::Relaxed);
+        rate >= 100 || (rate != 0 && random_range(0..100) < rate)
     }
 
     pub(crate) fn should_promote_scan_page(&self) -> bool {
-        get_rng().random_range(0..100) < self.config.scan_promotion_rate.load(Ordering::Relaxed)
+        let rate = self.config.scan_promotion_rate.load(Ordering::Relaxed);
+        rate >= 100 || (rate != 0 && random_range(0..100) < rate)
     }
 
     /// Chance% to promote a base read record to mini page.
@@ -1044,8 +1040,13 @@ impl BfTree {
                 let insert_success =
                     mini_page_ref.insert(write_op.key, write_op.value, write_op.op_type, 0);
                 assert!(insert_success);
-
                 debug_assert!(mini_page_ref.meta.meta_count_with_fence() > 0);
+
+                if let Some(wal) = &self.wal {
+                    let lsn = wal.append_and_wait(&write_op, u64::MAX);
+                    leaf_entry.update_lsn(lsn);
+                }
+
                 counter!(InsertCreatedMiniPage);
             }
             _ => {
@@ -1675,7 +1676,41 @@ pub(crate) fn eviction_callback(
 #[cfg(test)]
 mod tests {
     use crate::error::ConfigError;
-    use crate::BfTree;
+    use crate::wal::{LogEntryImpl, WriteOp};
+    use crate::{BfTree, LeafInsertResult, WalConfig, WalReader};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    #[test]
+    fn cache_only_tree_can_write_wal() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let wal_path = temp_dir.path().join("cache-only.wal");
+        let mut wal_config = WalConfig::new(&wal_path);
+        wal_config
+            .segment_size(512)
+            .flush_interval(Duration::from_micros(1));
+
+        let mut config = crate::Config::new(":cache:", 64 * 1024);
+        config.enable_write_ahead_log(Arc::new(wal_config));
+        let tree = BfTree::with_config(config, None).unwrap();
+        assert_eq!(tree.insert(b"key", b"value"), LeafInsertResult::Success);
+        drop(tree);
+
+        let reader = WalReader::new(&wal_path, 512);
+        let entries = reader
+            .segment_iter()
+            .flat_map(|segment| {
+                segment
+                    .entry_iter()
+                    .map(|(_, data)| data.to_vec())
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(entries.len(), 1);
+        let op = WriteOp::read_from_buffer(&entries[0]);
+        assert_eq!(op.key, b"key");
+        assert_eq!(op.value, b"value");
+    }
 
     #[test]
     fn test_mini_page_size_classes() {
