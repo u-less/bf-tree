@@ -1276,7 +1276,14 @@ impl CPRSnapShotMgr {
                 if inner.as_ref().meta.children_is_leaf() {
                     continue;
                 }
-                for (idx, c) in inner.as_ref().get_child_iter().enumerate() {
+                let child_count = inner.as_ref().meta.meta_count_with_fence() as usize;
+                for idx in 0..child_count {
+                    // Copy this child ID before mutating the node; an iterator
+                    // would retain a shared borrow across update_at_pos.
+                    let c = {
+                        let node = inner.as_ref();
+                        node.get_value(node.get_kv_meta(idx as u16))
+                    };
                     let offset = inner_map.get(&c.as_inner_node()).unwrap();
                     recovery_snapshot_vfs.read(*offset, &mut inner_node_page_buffer);
                     let inner_page =

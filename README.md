@@ -169,6 +169,10 @@ Fuzz testing is a bug finding technique that generates random inputs to the syst
 
 Check the [benchmark](benchmark/README.md) folder for more details.
 
+For portable in-memory benchmarks, optimization details, and memory-safety
+validation, see [performance](doc/performance.md). Run `cargo bench --bench in_memory`
+from the repository root on Windows, Linux, or macOS.
+
 ```bash
 cd benchmark
 env SHUMAI_FILTER="inmemory" MIMALLOC_LARGE_OS_PAGES=1 cargo run --bin bftree --release

@@ -78,3 +78,13 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("spdk"))']
 
 [profile.release]
 debug = true
+
+# Opt in when measuring a deployment build. Keep unwinding for RAII cleanup.
+[profile.perf]
+inherits = "release"
+lto = "thin"
+codegen-units = 1
+
+[[bench]]
+name = "in_memory"
+harness = false

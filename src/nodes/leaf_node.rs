@@ -89,7 +89,9 @@ impl LeafKVMeta {
         let mut meta = Self {
             offset,
             op_type_key_len_in_byte: key.len() as u16 | ((op_type as u16) << OP_TYPE_SHIFT),
-            ref_value_len_in_byte: std::sync::atomic::AtomicU16::new(value_len),
+            // A new record starts unreferenced, including when consolidation
+            // recreates metadata. Initialize the bit directly before publication.
+            ref_value_len_in_byte: std::sync::atomic::AtomicU16::new(value_len & VALUE_LEN_MASK),
             preview_bytes: [0; PREVIEW_SIZE],
         };
 
@@ -97,9 +99,6 @@ impl LeafKVMeta {
             meta.preview_bytes[i] = key[i + prefix_len as usize];
         }
 
-        // The initial value is not referenced, this is important because during the Garbage reclaim of the delta chain,
-        // we will call Insert to reset the states, which calls this function.
-        meta.clear_ref();
         meta
     }
 
@@ -158,6 +157,7 @@ impl LeafKVMeta {
             .fetch_or(REF_BIT_MASK, atomic::Ordering::Relaxed);
     }
 
+    #[cfg(test)]
     pub fn clear_ref(&self) {
         self.ref_value_len_in_byte
             .fetch_and(!REF_BIT_MASK, atomic::Ordering::Relaxed);
@@ -249,7 +249,8 @@ impl LeafNode {
 
     pub(crate) fn make_base_page(node_size: usize, snapshot_version: u64) -> *mut Self {
         let layout = Layout::from_size_align(node_size, std::mem::align_of::<LeafNode>()).unwrap();
-        let ptr = unsafe { std::alloc::alloc(layout) };
+        // Base pages are persisted as whole byte ranges, including unused space.
+        let ptr = unsafe { std::alloc::alloc_zeroed(layout) };
         if ptr.is_null() {
             std::alloc::handle_alloc_error(layout);
         }
@@ -329,6 +330,22 @@ impl LeafNode {
     ) {
         let ptr = ptr as *mut Self;
 
+        // Install every header field before creating a reference to fresh memory.
+        // In particular, initialize() intentionally preserves an existing page's LSN.
+        ptr.write(Self {
+            meta: NodeMeta::new(
+                Self::max_data_size(node_size) as u16,
+                false,
+                has_fence,
+                node_size as u16,
+                cache_only,
+            ),
+            prefix_len: 0,
+            next_level,
+            lsn: 0,
+            snapshot_version,
+            data: [],
+        });
         { &mut *ptr }.initialize(
             low_fence,
             high_fence,
@@ -399,6 +416,11 @@ impl LeafNode {
     }
 
     pub(crate) fn get_prefix(&self) -> &[u8] {
+        // Fence-less pages have no prefix metadata, and infinite fences use
+        // sentinel offsets outside the allocation. Neither may be dereferenced.
+        if self.prefix_len == 0 {
+            return &[];
+        }
         let m = self.get_kv_meta(LOW_FENCE_IDX);
         let key_offset = m.get_offset();
         unsafe {
@@ -1056,6 +1078,13 @@ impl LeafNode {
     }
 
     pub(crate) fn lower_bound(&self, key: &[u8]) -> u16 {
+        self.lower_bound_with_match(key).0
+    }
+
+    /// Return the insertion position and whether that position contains the key.
+    /// Keep the equality result so reads and updates do not compare a found key twice.
+    #[inline]
+    fn lower_bound_with_match(&self, key: &[u8]) -> (u16, bool) {
         let mut lower = self.first_meta_pos_after_fence();
         let mut upper = self.meta.meta_count_with_fence();
         let prefix_len = self.prefix_len as usize;
@@ -1064,9 +1093,9 @@ impl LeafNode {
             let prefix = self.get_prefix();
             let shared_len = prefix_len.min(key.len());
             match prefix[..shared_len].cmp(&key[..shared_len]) {
-                Ordering::Greater => return lower,
-                Ordering::Less => return upper,
-                Ordering::Equal if key.len() < prefix_len => return lower,
+                Ordering::Greater => return (lower, false),
+                Ordering::Less => return (upper, false),
+                Ordering::Equal if key.len() < prefix_len => return (lower, false),
                 Ordering::Equal => {}
             }
         }
@@ -1095,14 +1124,14 @@ impl LeafNode {
                     upper = mid;
                 }
                 Ordering::Equal => {
-                    return mid;
+                    return (mid, true);
                 }
                 Ordering::Less => {
                     lower = mid + 1;
                 }
             }
         }
-        lower
+        (lower, false)
     }
 
     /// Take a deep breath before you read/change this function.
@@ -1119,7 +1148,13 @@ impl LeafNode {
         op_type: OpType,
         max_fence_len: usize,
     ) -> bool {
-        debug_assert!(key.len() as u16 >= self.prefix_len);
+        // Check the packed metadata limits before narrowing lengths or copying.
+        if key.len() > KEY_LEN_MASK as usize || value.len() > VALUE_LEN_MASK as usize {
+            return false;
+        }
+        let Some(post_fix_len) = key.len().checked_sub(self.prefix_len as usize) else {
+            return false;
+        };
         match op_type {
             OpType::Insert | OpType::Cache => {
                 debug_assert!(!value.is_empty());
@@ -1127,73 +1162,66 @@ impl LeafNode {
             OpType::Delete | OpType::Phantom => {}
         }
 
-        let post_fix_len = key.len() as u16 - self.prefix_len;
+        let post_fix_len = post_fix_len as u16;
         let val_len = value.len() as u16;
         let kv_len = post_fix_len + val_len;
 
-        let value_count_with_fence = self.meta.meta_count_with_fence();
+        let (pos, found) = self.lower_bound_with_match(key);
+        let pos = pos as usize;
 
-        let pos = self.lower_bound(key) as usize;
-
-        if pos < value_count_with_fence as usize {
-            let prefix_len = self.prefix_len as usize;
+        if found {
             let pos_meta = self.get_kv_meta(pos);
-            let pos_key = self.get_remaining_key(pos_meta);
-            let search_key_postfix = &key[prefix_len..];
-            if pos_key.cmp(search_key_postfix) == Ordering::Equal {
-                // The key already exists.
-                counter!(LeafInsertDuplicate);
-                if op_type == OpType::Delete {
-                    let pos_meta = self.get_kv_meta_mut(pos);
-                    pos_meta.mark_as_deleted();
-                    return true;
-                }
+            // The key already exists.
+            counter!(LeafInsertDuplicate);
+            if op_type == OpType::Delete {
+                let pos_meta = self.get_kv_meta_mut(pos);
+                pos_meta.mark_as_deleted();
+                return true;
+            }
 
-                let pos_value = self.get_value(pos_meta);
-                let pos_value_len = pos_value.len() as u16;
+            let pos_value_len = pos_meta.value_len();
+            let pos_offset = pos_meta.offset;
 
-                if pos_value_len >= val_len {
-                    // we are lucky, old value is larger than new value. We just overwrite the old value.
-                    unsafe {
-                        let pair_ptr = self.data.as_ptr().add(pos_meta.offset as usize) as *mut u8;
-                        std::ptr::copy_nonoverlapping(
-                            value.as_ptr(),
-                            pair_ptr.add(post_fix_len as usize),
-                            val_len as usize,
-                        );
-                    }
-                    let pos_meta = self.get_kv_meta_mut(pos);
-                    pos_meta.set_value_len(val_len);
-                    pos_meta.set_op_type(op_type);
-                    return true;
-                }
-
-                if self.meta.remaining_size < kv_len {
-                    return false;
-                }
-                assert!(op_type != OpType::Cache);
-                let offset = self.current_lowest_offset() - kv_len;
+            if pos_value_len >= val_len {
+                // we are lucky, old value is larger than new value. We just overwrite the old value.
                 unsafe {
-                    let pair_ptr = self.data.as_ptr().add(offset as usize) as *mut u8;
-
-                    let pos_meta = self.get_kv_meta_mut(pos);
-                    pos_meta.set_value_len(val_len);
-                    pos_meta.set_op_type(op_type);
-                    pos_meta.offset = offset;
-                    std::ptr::copy_nonoverlapping(
-                        key[self.prefix_len as usize..].as_ptr(),
-                        pair_ptr,
-                        post_fix_len as usize,
-                    );
+                    let pair_ptr = self.data.as_mut_ptr().add(pos_offset as usize);
                     std::ptr::copy_nonoverlapping(
                         value.as_ptr(),
                         pair_ptr.add(post_fix_len as usize),
                         val_len as usize,
                     );
                 }
-                self.meta.remaining_size -= kv_len;
+                let pos_meta = self.get_kv_meta_mut(pos);
+                pos_meta.set_value_len(val_len);
+                pos_meta.set_op_type(op_type);
                 return true;
             }
+
+            if self.meta.remaining_size < kv_len {
+                return false;
+            }
+            assert!(op_type != OpType::Cache);
+            let offset = self.current_lowest_offset() - kv_len;
+            unsafe {
+                let pos_meta = self.get_kv_meta_mut(pos);
+                pos_meta.set_value_len(val_len);
+                pos_meta.set_op_type(op_type);
+                pos_meta.offset = offset;
+                let pair_ptr = self.data.as_mut_ptr().add(offset as usize);
+                std::ptr::copy_nonoverlapping(
+                    key[self.prefix_len as usize..].as_ptr(),
+                    pair_ptr,
+                    post_fix_len as usize,
+                );
+                std::ptr::copy_nonoverlapping(
+                    value.as_ptr(),
+                    pair_ptr.add(post_fix_len as usize),
+                    val_len as usize,
+                );
+            }
+            self.meta.remaining_size -= kv_len;
+            return true;
         }
 
         // The key is not already in the node.
@@ -1443,7 +1471,15 @@ impl LeafNode {
         skip_key: Option<&[u8]>,
         snapshot_version: u64,
     ) {
-        let mut pairs = Vec::new();
+        // Keep owned scratch data before initialize overwrites the page. Packing
+        // keys and values into one buffer avoids two heap allocations per record.
+        let mut pairs = Vec::with_capacity(self.meta.meta_count_without_fence() as usize);
+        let payload_len = self
+            .meta_iter()
+            .map(|meta| meta.get_key_len() as usize + meta.value_len() as usize)
+            .sum();
+        let mut payload = Vec::with_capacity(payload_len);
+        let prefix = self.get_prefix();
 
         for meta in self.meta_iter() {
             if skip_tombstone && meta.op_type() == OpType::Delete {
@@ -1451,24 +1487,14 @@ impl LeafNode {
                 continue;
             }
 
-            match skip_key {
-                // Skip the record with the skip_key
-                Some(s_k) => {
-                    let k = self.get_full_key(meta);
-                    let cmp = s_k.cmp(&k);
-
-                    if cmp != Ordering::Equal {
-                        pairs.push((k, self.get_value(meta).to_owned(), meta.op_type()));
-                    }
-                }
-                None => {
-                    pairs.push((
-                        self.get_full_key(meta),
-                        self.get_value(meta).to_owned(),
-                        meta.op_type(),
-                    ));
-                }
+            if skip_key.is_some_and(|key| self.key_cmp(meta, key) == Ordering::Equal) {
+                continue;
             }
+
+            payload.extend_from_slice(prefix);
+            payload.extend_from_slice(self.get_remaining_key(meta));
+            payload.extend_from_slice(self.get_value(meta));
+            pairs.push((meta.get_key_len(), meta.value_len(), meta.op_type()));
         }
 
         let has_fence = self.has_fence();
@@ -1494,11 +1520,15 @@ impl LeafNode {
             snapshot_version,
         );
 
-        for (key, value, op_type) in pairs {
+        let mut payload = payload.as_slice();
+        for (key_len, value_len, op_type) in pairs {
+            let (key, rest) = payload.split_at(key_len as usize);
+            let (value, rest) = rest.split_at(value_len as usize);
+            payload = rest;
             let rt = if op_type == OpType::Delete {
-                self.insert(&key, &value, OpType::Delete, 0)
+                self.insert(key, value, OpType::Delete, 0)
             } else {
-                self.insert(&key, &value, new_optype, 0)
+                self.insert(key, value, new_optype, 0)
             };
             assert!(rt);
         }
@@ -1574,18 +1604,19 @@ impl LeafNode {
     ) {
         assert!(!self.is_base_page());
         assert!(self.meta.node_size as usize <= dst_size);
+        unsafe {
+            Self::init_node_with_fence(
+                dst_node.cast::<u8>(),
+                &[],
+                &[],
+                dst_size,
+                self.next_level,
+                false, // Mini-page only, thus no fence
+                self.meta.is_cache_only_leaf(),
+                snapshot_version,
+            );
+        }
         let dst_ref = unsafe { &mut *dst_node };
-        let empty = vec![];
-
-        dst_ref.initialize(
-            &empty,
-            &empty,
-            dst_size,
-            self.next_level,
-            false, // Mini-page only, thus no fence
-            self.meta.is_cache_only_leaf(),
-            snapshot_version,
-        );
 
         for meta in self.meta_iter() {
             let op = meta.op_type();
@@ -1706,10 +1737,13 @@ impl LeafNode {
         binary_search: bool,
     ) -> LeafReadResult {
         let val_count = self.meta.meta_count_with_fence();
-        let pos = if binary_search {
-            self.lower_bound(search_key)
+        let (pos, found) = if binary_search {
+            self.lower_bound_with_match(search_key)
         } else {
-            self.linear_lower_bound(search_key)
+            let pos = self.linear_lower_bound(search_key);
+            let found = pos < val_count
+                && self.key_cmp(self.get_kv_meta(pos as usize), search_key) == Ordering::Equal;
+            (pos, found)
         };
 
         if pos >= val_count {
@@ -1718,7 +1752,7 @@ impl LeafNode {
         }
 
         let kv_meta = self.get_kv_meta(pos as usize);
-        if self.key_cmp(kv_meta, search_key) != Ordering::Equal {
+        if !found {
             counter!(LeafNotFoundDueToKey);
             LeafReadResult::NotFound
         } else {
@@ -2044,6 +2078,10 @@ mod tests {
         assert_eq!(meta.value_len(), 20);
         assert_eq!(meta.preview_bytes, [3, 4]);
         assert_eq!(meta.op_type(), OpType::Insert);
+        assert!(!meta.is_referenced());
+
+        let meta = LeafKVMeta::make_prefixed_meta(0, u16::MAX, &key, 0, OpType::Cache);
+        assert_eq!(meta.value_len(), VALUE_LEN_MASK);
         assert!(!meta.is_referenced());
     }
 
