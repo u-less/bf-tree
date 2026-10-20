@@ -761,6 +761,19 @@ impl<'a> LeafEntryXLocked<'a> {
                     return Ok(());
                 }
 
+                if *cache_only
+                    && op_type == OpType::Insert
+                    && (mini_page.meta.node_size as usize) < storage.config.leaf_page_size
+                    && mini_page.try_reclaim_for_insert(
+                        key,
+                        value,
+                        snapshot_guard.snapshot_version(),
+                    )
+                {
+                    counter!(InsertToMiniPageSuccess);
+                    return Ok(());
+                }
+
                 let kv_size = key_value_physical_size(key, value);
                 let new_size =
                     mini_page.new_size_if_upgrade(kv_size, mini_page_size_classes, *cache_only);

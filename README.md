@@ -173,6 +173,13 @@ For portable in-memory benchmarks, optimization details, and memory-safety
 validation, see [performance](doc/performance.md). Run `cargo bench --bench in_memory`
 from the repository root on Windows, Linux, or macOS.
 
+For adaptive leaf merging, cache-only space reclamation, and paired benchmarks
+including paged-memory and buffered-file workloads, see the
+[2026-10-20 algorithm optimization report (中文)](doc/algorithm-optimization-2026-10-20.md).
+For the follow-up on sparse long-key updates, including three-version comparisons
+and remaining microbenchmark regressions, see the
+[sparse merge optimization report (中文)](doc/sparse-merge-optimization-2026-10-20.md).
+
 For the latest review against `2bdb766`, including leaf rebuild optimizations,
 WAL and recovery fixes, and remaining safety limitations, see the
 [2026-09-27 review (中文)](doc/review-2026-09-27.md).

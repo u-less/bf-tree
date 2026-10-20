@@ -88,3 +88,7 @@ codegen-units = 1
 [[bench]]
 name = "in_memory"
 harness = false
+
+[[bench]]
+name = "algorithm_paths"
+harness = false

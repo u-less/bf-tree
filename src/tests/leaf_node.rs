@@ -39,6 +39,264 @@ impl Drop for TestBasePage {
 }
 
 #[test]
+fn leaf_merge_reclaims_overwrites_without_splitting() {
+    let mut base = TestBasePage::new(4096);
+    let mut mini = TestBasePage::new(4096);
+    let base = base.page();
+    let mini = mini.page();
+    mini.initialize(&[], &[], 4096, MiniPageNextLevel::new(0), false, false, 29);
+    for id in 0u64..48 {
+        assert!(base.insert(&id.to_be_bytes(), &[1; 64], OpType::Insert, 0));
+        assert!(mini.insert(&id.to_be_bytes(), &[2; 32], OpType::Insert, 0));
+    }
+    base.lsn = 193;
+    assert!(base.merge_mini_page(mini, 16));
+    assert_eq!(base.lsn, 193);
+    assert_eq!(base.get_clean_snapshot_version(), 29);
+    assert_eq!(base.meta.meta_count_without_fence(), 48);
+    assert!(base.meta.remaining_size > 1600);
+    let mut out = [0; 64];
+    for id in 0u64..48 {
+        assert_eq!(
+            base.read_by_key(&id.to_be_bytes(), &mut out),
+            LeafReadResult::Found(32)
+        );
+        assert_eq!(&out[..32], &[2; 32]);
+    }
+}
+
+#[test]
+fn leaf_merge_failure_preserves_page_and_reserves_fences() {
+    for (count, value_len, reserve) in [(60, 64, 16), (50, 64, 128)] {
+        let mut base = TestBasePage::new(4096);
+        let mut mini = TestBasePage::new(8192);
+        let base = base.page();
+        let mini = mini.page();
+        mini.initialize(&[], &[], 8192, MiniPageNextLevel::new(0), false, false, 29);
+        base.lsn = 193;
+        base.set_snapshot_version(17, false);
+        for id in 0u64..count {
+            assert!(mini.insert(&id.to_be_bytes(), &vec![2; value_len], OpType::Insert, 0));
+        }
+        let before = base.snapshot_bytes().to_vec();
+        assert!(!base.merge_mini_page(mini, reserve));
+        assert_eq!(base.snapshot_bytes(), before);
+    }
+}
+
+#[test]
+fn leaf_sparse_merge_accounts_for_in_place_overwrite_and_growth() {
+    for value_len in [32, 64, 80] {
+        let mut base = TestBasePage::new(4096);
+        let mut mini = TestBasePage::new(4096);
+        let base = base.page();
+        let mini = mini.page();
+        mini.initialize(&[], &[], 4096, MiniPageNextLevel::new(0), false, false, 21);
+        for id in 0u64..50 {
+            assert!(base.insert(&id.to_be_bytes(), &[1; 64], OpType::Insert, 0));
+        }
+        // Only 48 bytes remain. Shrinking and equal-size replacements can be
+        // applied in place; growth fits only after reclaiming the old payload.
+        assert_eq!(base.meta.remaining_size, 48);
+        assert!(mini.insert(&7u64.to_be_bytes(), &vec![2; value_len], OpType::Insert, 0));
+        assert!(base.merge_mini_page(mini, 16));
+        assert_eq!(
+            base.meta.remaining_size,
+            if value_len <= 64 { 48 } else { 32 }
+        );
+        assert_eq!(base.meta.meta_count_without_fence(), 50);
+        assert_eq!(base.get_clean_snapshot_version(), 21);
+        let mut out = [0; 80];
+        for id in 0u64..50 {
+            let len = if id == 7 { value_len } else { 64 };
+            assert_eq!(
+                base.read_by_key(&id.to_be_bytes(), &mut out),
+                LeafReadResult::Found(len as u32)
+            );
+            assert_eq!(&out[..len], &vec![if id == 7 { 2 } else { 1 }; len]);
+        }
+    }
+}
+
+#[test]
+fn leaf_sorted_merge_preserves_short_suffixes_and_clears_reference_bits() {
+    for prefix in [vec![], vec![0, 255, 0, 128], vec![b'p'; 120]] {
+        let mut base = TestBasePage::new(4096);
+        let mut mini = TestBasePage::new(4096);
+        let base = base.page();
+        let mini = mini.page();
+        let mut high = prefix.clone();
+        high.push(255);
+        base.initialize(
+            &prefix,
+            &high,
+            4096,
+            MiniPageNextLevel::new_null(),
+            true,
+            false,
+            7,
+        );
+        mini.initialize(&[], &[], 4096, MiniPageNextLevel::new(0), false, false, 9);
+        let keys: Vec<_> = (0..12u8)
+            .map(|id| {
+                let mut key = prefix.clone();
+                if id != 0 {
+                    key.push(id - 1);
+                }
+                key
+            })
+            .collect();
+        for (id, key) in keys.iter().enumerate() {
+            assert!(base.insert(key, &[id as u8; 16], OpType::Insert, 0));
+        }
+        // Include empty and one-byte suffixes, with nonzero unused preview bytes.
+        for pos in 2..14 {
+            let prefix_len = prefix.len();
+            let meta = base.get_kv_meta_mut(pos);
+            meta.mark_as_ref();
+            meta.fill_unused_preview_bytes(prefix_len, 0xff);
+        }
+        for key in &keys[4..9] {
+            assert!(mini.insert(key, &[42; 24], OpType::Insert, 0));
+        }
+        assert!(mini.insert(&keys[10], &[], OpType::Delete, 0));
+        base.lsn = 73;
+        assert!(base.merge_mini_page(mini, 2 * high.len()));
+        assert_eq!(base.lsn, 73);
+        assert_eq!(base.get_clean_snapshot_version(), 9);
+        assert_eq!(base.get_low_fence_key(), prefix);
+        assert_eq!(base.get_high_fence_key(), high);
+        assert!(base.meta_iter().all(|meta| !meta.is_referenced()));
+        let mut out = [0; 24];
+        for (id, key) in keys.iter().enumerate() {
+            if id == 10 {
+                assert_eq!(base.read_by_key(key, &mut out), LeafReadResult::NotFound);
+            } else {
+                let (byte, len) = if (4..9).contains(&id) {
+                    (42, 24)
+                } else {
+                    (id as u8, 16)
+                };
+                assert_eq!(base.read_by_key(key, &mut out), LeafReadResult::Found(len));
+                assert_eq!(&out[..len as usize], &vec![byte; len as usize]);
+            }
+        }
+    }
+}
+
+#[test]
+fn leaf_cache_reclaim_keeps_capacity_and_replaces_growing_value() {
+    let mut allocation = TestBasePage::new(512);
+    let leaf = allocation.page();
+    leaf.initialize(&[], &[], 512, MiniPageNextLevel::new_null(), false, true, 0);
+    for id in 0u64..5 {
+        assert!(leaf.insert(&id.to_be_bytes(), &[1; 48], OpType::Insert, 0));
+    }
+    for id in 0u64..5 {
+        assert!(leaf.insert(&id.to_be_bytes(), &[2; 16], OpType::Insert, 0));
+    }
+    assert!(leaf.insert(&0u64.to_be_bytes(), &[3; 96], OpType::Insert, 0));
+    assert!(!leaf.insert(&1u64.to_be_bytes(), &[4; 96], OpType::Insert, 0));
+    leaf.lsn = 73;
+    assert!(leaf.try_reclaim_for_insert(&1u64.to_be_bytes(), &[4; 96], 31));
+    assert_eq!(leaf.meta.node_size, 512);
+    assert_eq!(leaf.lsn, 73);
+    assert_eq!(leaf.get_clean_snapshot_version(), 31);
+    assert_eq!(leaf.meta.meta_count_without_fence(), 5);
+    let mut out = [0; 96];
+    for (id, byte, len) in [
+        (0u64, 3u8, 96),
+        (1, 4, 96),
+        (2, 2, 16),
+        (3, 2, 16),
+        (4, 2, 16),
+    ] {
+        assert_eq!(
+            leaf.read_by_key(&id.to_be_bytes(), &mut out),
+            LeafReadResult::Found(len as u32)
+        );
+        assert_eq!(&out[..len], &vec![byte; len]);
+    }
+    let before = leaf.snapshot_bytes().to_vec();
+    assert!(!leaf.try_reclaim_for_insert(&8u64.to_be_bytes(), &[5; 400], 32));
+    assert_eq!(leaf.snapshot_bytes(), before);
+}
+
+proptest! {
+    #![proptest_config(Config::with_cases(256))]
+
+    #[test]
+    fn leaf_sorted_merge_matches_map(
+        prefix in proptest::collection::vec(any::<u8>(), 0..128),
+        changes in proptest::collection::vec(
+            (0u8..48, proptest::collection::vec(any::<u8>(), 1..48), 0u8..4),
+            1..80,
+        ),
+        mini_prefixed in any::<bool>(),
+    ) {
+        let mut base = TestBasePage::new(8192);
+        let mut mini = TestBasePage::new(16384);
+        let base = base.page();
+        let mini = mini.page();
+        let mut low = prefix.clone();
+        low.push(0);
+        let mut high = prefix.clone();
+        high.push(255);
+        base.initialize(&low, &high, 8192, MiniPageNextLevel::new_null(), true, false, 7);
+        mini.initialize(
+            if mini_prefixed { &low } else { &[] },
+            if mini_prefixed { &high } else { &[] },
+            16384, MiniPageNextLevel::new(128), mini_prefixed, false, 9,
+        );
+        let key_for = |id: u8| {
+            let mut key = prefix.clone();
+            key.extend_from_slice(&[1, id, 0]);
+            key
+        };
+        let mut model = BTreeMap::new();
+        let mut delta = BTreeMap::new();
+        for id in 0..32 {
+            let key = key_for(id);
+            assert!(base.insert(&key, &[id; 24], OpType::Insert, 0));
+            if id % 7 == 0 {
+                assert!(base.insert(&key, &[], OpType::Delete, 0));
+            } else {
+                model.insert(key, vec![id; 24]);
+            }
+        }
+        for (id, value, op) in changes {
+            delta.insert(key_for(id), (value, op));
+        }
+        for (key, (value, op)) in &delta {
+            let op = match op { 0 => OpType::Delete, 1 => OpType::Insert, 2 => OpType::Cache, _ => OpType::Phantom };
+            assert!(mini.insert(key, value, op, 0));
+            match op {
+                OpType::Insert => { model.insert(key.clone(), value.clone()); }
+                OpType::Delete => { model.remove(key); }
+                _ => {}
+            }
+        }
+        let mini_before = mini.snapshot_bytes().to_vec();
+        base.lsn = 52;
+        prop_assert!(base.merge_mini_page(mini, 2 * (prefix.len() + 3)));
+        prop_assert_eq!(base.lsn, 52);
+        prop_assert_eq!(base.get_clean_snapshot_version(), 9);
+        prop_assert_eq!(base.get_low_fence_key(), low);
+        prop_assert_eq!(base.get_high_fence_key(), high);
+        prop_assert_eq!(mini.snapshot_bytes(), mini_before);
+        let mut actual = BTreeMap::new();
+        let mut out = [0; 48];
+        for id in 0..48 {
+            let key = key_for(id);
+            if let LeafReadResult::Found(len) = base.read_by_key(&key, &mut out) {
+                actual.insert(key, out[..len as usize].to_vec());
+            }
+        }
+        prop_assert_eq!(actual, model);
+    }
+}
+
+#[test]
 fn leaf_consolidation_keeps_clean_tombstones_absent() {
     for skip_tombstone in [false, true] {
         let mut allocation = TestBasePage::new(4096);

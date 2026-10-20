@@ -1,0 +1,238 @@
+{
+  "baseline_revision": "6fd826fb1a3a4a29cfa0902428428376449b667d",
+  "previous_revision": "previous uncommitted candidate; production hashes match prior report",
+  "candidate_revision": "current uncommitted working tree",
+  "compiler": "rustc 1.98.1 (48a229cea 2026-09-01), LLVM 22.1.8",
+  "profile": "release/bench, no LTO/PGO/native",
+  "machine": "i7-13700KF, Windows 11 10.0.26220",
+  "affinity_mask": 16,
+  "rounds": 6,
+  "samples": 9,
+  "measured_at": "2026-10-20T23:39:00.1401101+08:00",
+  "sources": [
+    {
+      "revision": "baseline",
+      "source_root": "target/algorithm-20261020/baseline",
+      "files": [
+        {
+          "path": "src/nodes/leaf_node.rs",
+          "sha256": "287895fedd9a4b7ab54651f0077bc9381dccbfd6efca512269e246c2f6611110"
+        },
+        {
+          "path": "src/mini_page_op.rs",
+          "sha256": "7137f9e2f2fffe663d28fc6827d03f92f7615c25b0ba9a7321d92eae8d9b4e70"
+        },
+        {
+          "path": "src/tests/leaf_node.rs",
+          "sha256": "041027ebad69b338273b566a98f70338013c98eceef1bb51ba8b7517c34a5428"
+        },
+        {
+          "path": "src/tests/algorithm_bench.rs",
+          "sha256": "5fa06f3945e59b6aedf8b38a0113b285d06cb16612fcaf3d728b2ce43ccadb7a"
+        },
+        {
+          "path": "src/tests/mod.rs",
+          "sha256": "2d041b3443b2ba8f3333a5c922268612465fa0755bec66b9dcb61c5df6febf57"
+        },
+        {
+          "path": "benches/in_memory.rs",
+          "sha256": "81754b22e8fe4a1d834dece299e2dfdb2ccaa01079bb6ce962ccb7877dd98c4a"
+        },
+        {
+          "path": "benches/algorithm_paths.rs",
+          "sha256": "e751acc254fd0687216ff8030445ca753697b83667e8440144d4553278918590"
+        },
+        {
+          "path": "Cargo.toml",
+          "sha256": "717e6e022bdf8274bf09e62609e5334c358eae909ed4f054c313787f27621598"
+        },
+        {
+          "path": "Cargo.lock",
+          "sha256": "135d5406b19be87047b2a12e960497dfc28100d4d2a66a7dca887801fc21da73"
+        }
+      ]
+    },
+    {
+      "revision": "previous",
+      "source_root": "target/sparse-20261020/previous",
+      "files": [
+        {
+          "path": "src/nodes/leaf_node.rs",
+          "sha256": "7119c0810208877512721983a806af8d0d7f6ceea077ccc79b94fd095d531923"
+        },
+        {
+          "path": "src/mini_page_op.rs",
+          "sha256": "e99b874d5fb11211722fc08132751889fc21bf3fb0c76fa3ae09614acce1fb3b"
+        },
+        {
+          "path": "src/tests/leaf_node.rs",
+          "sha256": "f195652e8a0a2ed3c6284b5c9ba46ce045d1cccc1e1930c7e166aba417f0fa50"
+        },
+        {
+          "path": "src/tests/algorithm_bench.rs",
+          "sha256": "8205fca8ce858a3f3c6d1a058dbbede6e2222f42aad6b3e61b77fdd2bf1813f0"
+        },
+        {
+          "path": "src/tests/mod.rs",
+          "sha256": "b0012b92498c23ea26bc9edb5a7ccd8cf6bb7f27c86226f94d549021108b6862"
+        },
+        {
+          "path": "benches/in_memory.rs",
+          "sha256": "81754b22e8fe4a1d834dece299e2dfdb2ccaa01079bb6ce962ccb7877dd98c4a"
+        },
+        {
+          "path": "benches/algorithm_paths.rs",
+          "sha256": "e751acc254fd0687216ff8030445ca753697b83667e8440144d4553278918590"
+        },
+        {
+          "path": "Cargo.toml",
+          "sha256": "717e6e022bdf8274bf09e62609e5334c358eae909ed4f054c313787f27621598"
+        },
+        {
+          "path": "Cargo.lock",
+          "sha256": "135d5406b19be87047b2a12e960497dfc28100d4d2a66a7dca887801fc21da73"
+        }
+      ]
+    },
+    {
+      "revision": "candidate",
+      "source_root": ".",
+      "files": [
+        {
+          "path": "src/nodes/leaf_node.rs",
+          "sha256": "892e6cdaeecb4b5f079de8264cfea94d691340edbf5350cfe7d82c925679f876"
+        },
+        {
+          "path": "src/mini_page_op.rs",
+          "sha256": "e99b874d5fb11211722fc08132751889fc21bf3fb0c76fa3ae09614acce1fb3b"
+        },
+        {
+          "path": "src/tests/leaf_node.rs",
+          "sha256": "606ec5e43a54f178861ac10f6e95da9ab14c47b6f650666f9e0d05562facb34e"
+        },
+        {
+          "path": "src/tests/algorithm_bench.rs",
+          "sha256": "8205fca8ce858a3f3c6d1a058dbbede6e2222f42aad6b3e61b77fdd2bf1813f0"
+        },
+        {
+          "path": "src/tests/mod.rs",
+          "sha256": "b0012b92498c23ea26bc9edb5a7ccd8cf6bb7f27c86226f94d549021108b6862"
+        },
+        {
+          "path": "benches/in_memory.rs",
+          "sha256": "81754b22e8fe4a1d834dece299e2dfdb2ccaa01079bb6ce962ccb7877dd98c4a"
+        },
+        {
+          "path": "benches/algorithm_paths.rs",
+          "sha256": "e751acc254fd0687216ff8030445ca753697b83667e8440144d4553278918590"
+        },
+        {
+          "path": "Cargo.toml",
+          "sha256": "717e6e022bdf8274bf09e62609e5334c358eae909ed4f054c313787f27621598"
+        },
+        {
+          "path": "Cargo.lock",
+          "sha256": "135d5406b19be87047b2a12e960497dfc28100d4d2a66a7dca887801fc21da73"
+        }
+      ]
+    }
+  ],
+  "binary_root": "target/sparse-20261020/bin",
+  "binaries": [
+    {
+      "path": "baseline/in_memory.exe",
+      "sha256": "9db4f9e5ca6613aa327739f33d7b0f99275ab41d0e34102b7d9e6f0c90c8db14"
+    },
+    {
+      "path": "baseline/algorithm_paths.exe",
+      "sha256": "d6010ebb059c5cb9ac447bab6ea2d9cbd435b0b01b2552e535a7d94bba7f0ab1"
+    },
+    {
+      "path": "baseline/leaf_tests.exe",
+      "sha256": "b4f63dfc2245314500ece53262b9887ff7ed6437ca7cc6cbf1935b4efcb34ebc"
+    },
+    {
+      "path": "previous/in_memory.exe",
+      "sha256": "ec37e0ac031a1ef38c7982f096bef0a36a7054673a2186cb79f6b5e47c48b55c"
+    },
+    {
+      "path": "previous/algorithm_paths.exe",
+      "sha256": "c460852adabddcdd33c71eba6a63c486de8b71d2935e0c290e74402a3ba78b94"
+    },
+    {
+      "path": "previous/leaf_tests.exe",
+      "sha256": "40ee1a00dd2e8ce44c100095e90a27ce949753ab211217d427933e751b0178fd"
+    },
+    {
+      "path": "candidate/in_memory.exe",
+      "sha256": "97b836e6dd93a213ae2e97883c26b82ba6eade5ac8c4921eab48f7691cb4f5c0"
+    },
+    {
+      "path": "candidate/algorithm_paths.exe",
+      "sha256": "773e433f7fe607e40075226f2158a363a843e656b9a7b75b1dfb0e1a60c42151"
+    },
+    {
+      "path": "candidate/leaf_tests.exe",
+      "sha256": "e1a62d5667cb006018d2357492e51344b71ca2b629e04296dfe49a64269eb8d0"
+    },
+    {
+      "path": "first-pass/in_memory.exe",
+      "sha256": "17b9e1e158b52cdcebf175e22b133f5a9f96c0ec81d4c77f075bdb47c010028e"
+    },
+    {
+      "path": "first-pass/algorithm_paths.exe",
+      "sha256": "cc69437cbfa58bcc94a24edf2f504a18cba91d52bc8bd286b36624d2222d2610"
+    },
+    {
+      "path": "first-pass/leaf_tests.exe",
+      "sha256": "df4fd7fd10d685f0db8b912f572ce7b3af4036d8a81970a8da10108fdf1d1bf9"
+    }
+  ],
+  "data": [
+    {
+      "path": "algorithm-benchmark-2026-10-20-sparse.csv",
+      "sha256": "15a64ead35828be5db015097eb8f11a626f532a790179753c2d7cdf74cf5dc53"
+    },
+    {
+      "path": "algorithm-benchmark-2026-10-20-growth.csv",
+      "sha256": "c77de550c252ce94c5c41af04386441cb9f0768a777b2e093d9aa876e8fcc40d"
+    },
+    {
+      "path": "algorithm-benchmark-2026-10-20-phases.csv",
+      "sha256": "9c6ed806b8bb2569a15ab08a4b92f140ff7bee231db34001cc610aded44f50ca"
+    },
+    {
+      "path": "algorithm-benchmark-2026-10-20-sparse-exploratory.csv",
+      "sha256": "bab417d1b53d397092d1642ffb9936e2f3f0f84c5997594c9968604712e704b8"
+    }
+  ],
+  "runner": [
+    {
+      "path": "benchmark/compare-algorithms.ps1",
+      "sha256": "ece782cd525439201777bfd22e711cae42df79c6175ba10fd482d79841bfc001"
+    }
+  ],
+  "exploratory_source": [
+    {
+      "path": "first-pass-leaf_node.rs",
+      "sha256": "d4dc116c26455f3cba26690626d492ac9d248e74d287abbe839205c2cff75087"
+    }
+  ],
+  "notes": [
+    "Formal phases disabled; separate diagnostic CSV has phases enabled.",
+    "Baseline growth failures are excluded from success-path growth comparison.",
+    "First-pass binaries and CSV are exploratory, not final candidate.",
+    "Original leaf_merge_microbench body verified identical across all versions.",
+    "Documentation edits after benchmark do not change measured production source."
+  ],
+  "validation": {
+    "release_unit_passed": 136,
+    "release_unit_ignored": 3,
+    "integration_passed": 1,
+    "doctest_passed": 10,
+    "doctest_ignored": 2,
+    "debug_leaf_passed": 40,
+    "miri_passed": 4,
+    "shuttle": "not rerun; previous baseline/candidate failures remain unresolved"
+  }
+}

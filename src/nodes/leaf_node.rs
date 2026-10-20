@@ -243,6 +243,15 @@ pub(crate) type LeafNode = LeafNodeStorage<[UnsafeCell<MaybeUninit<u8>>]>;
 
 const _: () = assert!(std::mem::size_of::<LeafNodeHeader>() == 32);
 
+/// Own the staging page until a merge has passed every capacity check.
+struct MergePage(*mut LeafNodeHeader);
+
+impl Drop for MergePage {
+    fn drop(&mut self) {
+        LeafNode::free_base_page(self.0);
+    }
+}
+
 impl LeafNode {
     /// Construct a bounded leaf pointer from its original allocation pointer.
     ///
@@ -1368,6 +1377,44 @@ impl LeafNode {
         self.append_sorted(key, source.get_value(meta), op_type)
     }
 
+    /// Append an unchanged live base record when rebuilding with identical
+    /// fences. The suffix, preview and value can be reused without materializing
+    /// the full key. Source and destination are separate allocations.
+    #[inline]
+    fn append_same_prefix(&mut self, source: &LeafNode, meta: &LeafKVMeta) -> bool {
+        debug_assert_eq!(self.get_prefix(), source.get_prefix());
+        debug_assert!(!meta.op_type().is_absent());
+        let value_len = meta.value_len();
+        let record_len = meta.get_key_len() - self.prefix_len + value_len;
+        if self.full_with_fences(record_len + std::mem::size_of::<LeafKVMeta>() as u16, 0) {
+            return false;
+        }
+        let pos = self.meta.meta_count_with_fence() as usize;
+        let offset = self.current_lowest_offset() - record_len;
+        let new_meta = LeafKVMeta {
+            offset,
+            op_type_key_len_in_byte: meta.get_key_len(),
+            ref_value_len_in_byte: std::sync::atomic::AtomicU16::new(value_len),
+            preview_bytes: meta.preview_bytes,
+        };
+        // The source's initialized payload contains the suffix followed by its
+        // value. Capacity was checked above, and the new metadata cannot overlap
+        // the destination payload.
+        unsafe {
+            let dst = self.data_ptr();
+            std::ptr::copy_nonoverlapping(
+                source.data_ptr().add(meta.offset as usize),
+                dst.add(offset as usize),
+                record_len as usize,
+            );
+            dst.cast::<LeafKVMeta>().add(pos).write(new_meta);
+        }
+        self.meta.remaining_size -= record_len + std::mem::size_of::<LeafKVMeta>() as u16;
+        self.meta.increment_value_count();
+        counter!(LeafInsertNew);
+        true
+    }
+
     /// The caller has checked lengths and located a vacant metadata position.
     #[inline]
     fn insert_new_at(
@@ -1740,6 +1787,37 @@ impl LeafNode {
         );
     }
 
+    /// Avoid growing a fragmented cache-only page when a replacement fits after
+    /// compaction. Reclaim at least a quarter page to amortize the rebuild.
+    /// Disk-backed mini pages cannot discard their deletion markers this way.
+    pub(crate) fn try_reclaim_for_insert(
+        &mut self,
+        key: &[u8],
+        value: &[u8],
+        snapshot_version: u64,
+    ) -> bool {
+        assert!(self.meta.is_cache_only_leaf() && !self.has_fence());
+        let (pos, found) = self.lower_bound_with_match(key);
+        let capacity = Self::max_data_size(self.meta.node_size as usize);
+        let mut retained_size = 0;
+        for (index, meta) in self.meta_iter().enumerate() {
+            if meta.op_type().is_absent() || (found && index == pos as usize) {
+                continue;
+            }
+            retained_size += meta.get_key_len() as usize
+                + meta.value_len() as usize
+                + std::mem::size_of::<LeafKVMeta>();
+        }
+        let needed = key.len() + value.len() + std::mem::size_of::<LeafKVMeta>();
+        let used = capacity - self.meta.remaining_size as usize;
+        if retained_size + needed > capacity || used.saturating_sub(retained_size) < capacity / 4 {
+            return false;
+        }
+        self.consolidate_skip_key(key, snapshot_version);
+        assert!(self.insert(key, value, OpType::Insert, 0));
+        true
+    }
+
     /// Copy a mini-page to a new memory location
     pub(crate) fn copy_initialize_to(
         &self,
@@ -2001,17 +2079,22 @@ impl LeafNode {
         false
     }
 
-    fn estimate_merge_size(&self) -> usize {
+    fn estimate_merge_size(&self) -> (usize, usize) {
         let mut required_size = 0;
+        let mut dirty_count = 0;
 
         for meta in self.meta_iter() {
-            if meta.op_type() == OpType::Insert {
+            let op = meta.op_type();
+            if op.is_dirty() {
+                dirty_count += 1;
+            }
+            if op == OpType::Insert {
                 required_size += (meta.get_key_len() + meta.value_len()) as usize
                     + std::mem::size_of::<LeafKVMeta>();
             }
         }
 
-        required_size
+        (required_size, dirty_count)
     }
 
     /// Determine if the leaf node has space of the requested_size given the full fence length
@@ -2045,16 +2128,31 @@ impl LeafNode {
     }
 
     pub(crate) fn merge_mini_page(&mut self, mini_page: &LeafNode, max_fence_len: usize) -> bool {
-        let size_required = mini_page.estimate_merge_size();
+        let (size_required, dirty_count) = mini_page.estimate_merge_size();
 
-        if self.full_with_fences(size_required as u16, max_fence_len) {
-            return false;
+        // Sparse deltas with ample free space are cheaper to apply in place.
+        // Otherwise rebuild in key order, including when the conservative
+        // estimate rejects a replacement that fits after reclaiming old data.
+        if dirty_count > 4 && dirty_count * 4 >= self.meta.meta_count_without_fence() as usize {
+            return self.merge_mini_page_sorted(mini_page, max_fence_len);
+        }
+        if size_required > u16::MAX as usize
+            || self.full_with_fences(size_required as u16, max_fence_len)
+        {
+            // An overwrite that fits its old value slot needs no free bytes.
+            // Check actual incremental space before paying for a whole-page copy.
+            let exact_size = self.incremental_merge_size(mini_page);
+            if exact_size > u16::MAX as usize
+                || self.full_with_fences(exact_size as u16, max_fence_len)
+            {
+                return self.merge_mini_page_sorted(mini_page, max_fence_len);
+            }
         }
 
         // Merge the clean snapshot version too.
         self.snapshot_version = mini_page.get_clean_snapshot_version();
+        let mut key_buffer = Vec::new();
         for meta in mini_page.meta_iter() {
-            let c_key = mini_page.get_full_key(meta);
             let c_type = meta.op_type();
             if !c_type.is_dirty() {
                 // This is important. We don't want to merge cache records, not only for performance but also correctness.
@@ -2063,11 +2161,129 @@ impl LeafNode {
                 // The scan operation want to keep the mini page (why not), but the records are all in cache mode.
                 continue;
             }
+            let c_key = if mini_page.prefix_len == 0 {
+                mini_page.get_remaining_key(meta)
+            } else {
+                key_buffer.clear();
+                key_buffer.extend_from_slice(mini_page.get_prefix());
+                key_buffer.extend_from_slice(mini_page.get_remaining_key(meta));
+                key_buffer.as_slice()
+            };
             let c_value = mini_page.get_value(meta);
-            let rt = self.insert(&c_key, c_value, c_type, 0);
+            let rt = self.insert(c_key, c_value, c_type, 0);
             assert!(rt);
         }
 
+        true
+    }
+
+    fn incremental_merge_size(&self, mini_page: &LeafNode) -> usize {
+        let mut required = 0;
+        let mut key_buffer = Vec::new();
+        for meta in mini_page
+            .meta_iter()
+            .filter(|meta| meta.op_type() == OpType::Insert)
+        {
+            let key = if mini_page.prefix_len == 0 {
+                mini_page.get_remaining_key(meta)
+            } else {
+                key_buffer.clear();
+                key_buffer.extend_from_slice(mini_page.get_prefix());
+                key_buffer.extend_from_slice(mini_page.get_remaining_key(meta));
+                key_buffer.as_slice()
+            };
+            let (pos, found) = self.lower_bound_with_match(key);
+            if found && self.get_kv_meta(pos as usize).value_len() >= meta.value_len() {
+                continue;
+            }
+            required += key.len() - self.prefix_len as usize + meta.value_len() as usize;
+            if !found {
+                required += std::mem::size_of::<LeafKVMeta>();
+            }
+        }
+        required
+    }
+
+    /// Merge two sorted streams into a separate page. Cache/Phantom entries in
+    /// the mini page are not authoritative; only dirty entries override base
+    /// records. A failed merge leaves the base page and its version untouched.
+    fn merge_mini_page_sorted(&mut self, mini_page: &LeafNode, max_fence_len: usize) -> bool {
+        assert!(self.is_base_page());
+        let node_size = self.meta.node_size as usize;
+        let staging = MergePage(Self::make_base_page(
+            node_size,
+            mini_page.get_clean_snapshot_version(),
+        ));
+        // The owner keeps the entire independent allocation live through commit.
+        let merged = unsafe { &mut *Self::from_raw_parts(staging.0, node_size) };
+        merged.initialize(
+            &self.get_low_fence_key(),
+            &self.get_high_fence_key(),
+            node_size,
+            self.next_level,
+            true,
+            false,
+            mini_page.get_clean_snapshot_version(),
+        );
+        merged.lsn = self.lsn;
+        let mut base = self.meta_iter().peekable();
+        let mut mini_key_buffer = Vec::new();
+        for meta in mini_page
+            .meta_iter()
+            .filter(|meta| meta.op_type().is_dirty())
+        {
+            let key = if mini_page.prefix_len == 0 {
+                mini_page.get_remaining_key(meta)
+            } else {
+                mini_key_buffer.clear();
+                mini_key_buffer.extend_from_slice(mini_page.get_prefix());
+                mini_key_buffer.extend_from_slice(mini_page.get_remaining_key(meta));
+                mini_key_buffer.as_slice()
+            };
+            // Every dirty key belongs to this page's fence range, hence shares
+            // its prefix. Compare that prefix only once, outside the base loop.
+            debug_assert!(key.starts_with(self.get_prefix()));
+            let suffix = &key[self.prefix_len as usize..];
+            while let Some(base_meta) = base.peek() {
+                match self.get_remaining_key(base_meta).cmp(suffix) {
+                    Ordering::Less => {
+                        let base_meta = base.next().unwrap();
+                        if !base_meta.op_type().is_absent()
+                            && !merged.append_same_prefix(self, base_meta)
+                        {
+                            return false;
+                        }
+                    }
+                    Ordering::Equal => {
+                        base.next();
+                        break;
+                    }
+                    Ordering::Greater => break,
+                }
+            }
+            if meta.op_type() == OpType::Insert
+                && !merged.append_sorted(key, mini_page.get_value(meta), OpType::Insert)
+            {
+                return false;
+            }
+        }
+        for meta in base {
+            if !meta.op_type().is_absent() && !merged.append_same_prefix(self, meta) {
+                return false;
+            }
+        }
+        if merged.full_with_fences(0, max_fence_len) {
+            return false;
+        }
+        // Both pages have identical allocation bounds. Publish only the fully
+        // built, initialized image while the caller holds the base write lock.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                merged.snapshot_bytes().as_ptr(),
+                self as *mut Self as *mut u8,
+                node_size,
+            );
+        }
         true
     }
 

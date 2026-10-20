@@ -3,6 +3,8 @@
 
 mod leaf_node;
 
+mod algorithm_bench;
+
 mod inner_node;
 
 mod tree;

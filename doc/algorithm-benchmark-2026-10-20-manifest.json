@@ -1,0 +1,65 @@
+{
+  "baseline_revision": "6fd826fb1a3a4a29cfa0902428428376449b667d",
+  "compiler": "rustc 1.98.1 (48a229cea 2026-09-01), LLVM 22.1.8",
+  "profile": "release/bench, no LTO/PGO/native",
+  "machine": "i7-13700KF, Windows 11 10.0.26220",
+  "affinity_mask": 16,
+  "pairs": 5,
+  "samples": 9,
+  "candidate_source": [
+    {
+      "path": "src/nodes/leaf_node.rs",
+      "sha256": "7119c0810208877512721983a806af8d0d7f6ceea077ccc79b94fd095d531923"
+    },
+    {
+      "path": "src/mini_page_op.rs",
+      "sha256": "e99b874d5fb11211722fc08132751889fc21bf3fb0c76fa3ae09614acce1fb3b"
+    },
+    {
+      "path": "benches/in_memory.rs",
+      "sha256": "81754b22e8fe4a1d834dece299e2dfdb2ccaa01079bb6ce962ccb7877dd98c4a"
+    },
+    {
+      "path": "benches/algorithm_paths.rs",
+      "sha256": "366921ee89bae834dc14aef0ce485d730180d2f41dcf55f6cac7569d7f0abd6b"
+    },
+    {
+      "path": "src/tests/algorithm_bench.rs",
+      "sha256": "5fa06f3945e59b6aedf8b38a0113b285d06cb16612fcaf3d728b2ce43ccadb7a"
+    },
+    {
+      "path": "Cargo.toml",
+      "sha256": "717e6e022bdf8274bf09e62609e5334c358eae909ed4f054c313787f27621598"
+    },
+    {
+      "path": "Cargo.lock",
+      "sha256": "135d5406b19be87047b2a12e960497dfc28100d4d2a66a7dca887801fc21da73"
+    }
+  ],
+  "binaries": [
+    {
+      "path": "baseline/algorithm_paths.exe",
+      "sha256": "4d64b3bacad3ff61dc0902f4c95c487eedb7768862d6fe68a4428e3cceed059d"
+    },
+    {
+      "path": "baseline/in_memory.exe",
+      "sha256": "9db4f9e5ca6613aa327739f33d7b0f99275ab41d0e34102b7d9e6f0c90c8db14"
+    },
+    {
+      "path": "baseline/leaf_tests.exe",
+      "sha256": "b4f63dfc2245314500ece53262b9887ff7ed6437ca7cc6cbf1935b4efcb34ebc"
+    },
+    {
+      "path": "candidate/algorithm_paths.exe",
+      "sha256": "9eb7d1edc74eef9d6e144a9c45a3fbc93bb0d65fcc17a54ddd465306afe20774"
+    },
+    {
+      "path": "candidate/in_memory.exe",
+      "sha256": "06955ce6367e95101bdc6363a3a6e8ef882d64a4815ee70abc736707d243e837"
+    },
+    {
+      "path": "candidate/leaf_tests.exe",
+      "sha256": "1859d8440f7358297a534400ae8712cfc93f8b4b0428cbc6362060934bb32b31"
+    }
+  ]
+}
